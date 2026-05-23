@@ -1,141 +1,108 @@
 """
-Imagenet-1K-subset.py  (thực tế dùng STL-10 unlabeled — 100K ảnh 96×96)
-------------------------------------------------------------------------
-1. Tải STL-10 binary từ Stanford nếu chưa có
-2. Đọc toàn bộ 100K ảnh unlabeled
-3. Shuffle với seed 42, chia 90/10 train/val
-4. Lưu ảnh PNG vào:
-       data/train/   (90 000 ảnh)
-       data/val/     (10 000 ảnh)
-   Tên file: 000000.png … 099999.png  (id toàn cục)
+Imagenet-1K-subset.py  —  ImageNet-1K resized via evanarlian/imagenet_1k_resized_256
+--------------------------------------------------------------------------------------
+- Stream 100K ảnh từ split "test" của evanarlian/imagenet_1k_resized_256
+  (ảnh gốc ImageNet-1K, cạnh ngắn resize về 256, đúng pipeline chuẩn I-JEPA)
+- RandomCrop 224×224 khi lưu
+- Shuffle seed 42, chia 90/10 train/val
+- Lưu JPEG vào data/train/ và data/val/ (cùng cấp với file này)
+  Tên file: 000000.jpg … 099999.jpg  (id toàn cục trước khi split)
 
-Cấu trúc thư mục kết quả:
-   I-JEPA/
-   ├── Imagenet-1K-subset.py
-   └── data/
-       ├── stl10_binary/          ← binary gốc (giữ lại để không tải lại)
-       ├── train/
-       │   └── xxxxxx.png
-       └── val/
-           └── xxxxxx.png
+Cấu trúc kết quả:
+  I-JEPA/
+  ├── Imagenet-1K-subset.py
+  └── data/
+      ├── train/   (90 000 ảnh, 224×224)
+      └── val/     (10 000 ảnh, 224×224)
 """
 
-import os
 import random
-import struct
-import tarfile
-import urllib.request
 from pathlib import Path
 
-import numpy as np
+from datasets import load_dataset
 from PIL import Image
+from torchvision import transforms
 from tqdm import tqdm
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────────
 SEED        = 42
 TRAIN_RATIO = 0.9
-DATA_URL    = "http://ai.stanford.edu/~acoates/stl10/stl10_binary.tar.gz"
+TOTAL       = 100_000
 DATA_DIR    = Path(__file__).parent / "data"
-BIN_DIR     = DATA_DIR / "stl10_binary"
-UNLABELED_BIN = BIN_DIR / "unlabeled_X.bin"   # 100K unlabeled images
-HEIGHT, WIDTH, DEPTH = 96, 96, 3
-# ─────────────────────────────────────────────────────────────────────────────
+HF_REPO     = "evanarlian/imagenet_1k_resized_256"
+HF_SPLIT    = "test"          # test split = đúng 100K ảnh
+CROP_SIZE   = 224
+JPEG_Q      = 95              # quality JPEG khi lưu
+# ────────────────────────────────────────────────────────────────────────────
+
+crop = transforms.RandomCrop(CROP_SIZE)
 
 
-# ── 1. Download & extract ─────────────────────────────────────────────────────
-def download_and_extract():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tar_path = DATA_DIR / "stl10_binary.tar.gz"
-
-    if UNLABELED_BIN.exists():
-        print(f"[1/4] Binary already exists, skipping download.")
-        return
-
-    if not tar_path.exists():
-        print(f"[1/4] Downloading STL-10 (~2.6 GB)...")
-        def _progress(block_num, block_size, total_size):
-            downloaded = block_num * block_size
-            pct = min(downloaded / total_size * 100, 100)
-            bar = int(pct // 2)
-            print(
-                f"\r  [{'█' * bar:<50}] {pct:5.1f}%  "
-                f"({downloaded/1e6:.0f}/{total_size/1e6:.0f} MB)",
-                end="", flush=True,
-            )
-        urllib.request.urlretrieve(DATA_URL, tar_path, reporthook=_progress)
-        print()  # newline sau progress bar
-        print(f"  Saved → {tar_path}")
-    else:
-        print(f"[1/4] Tar already downloaded, skipping.")
-
-    print(f"  Extracting...")
-    with tarfile.open(tar_path, "r:gz") as tf:
-        tf.extractall(DATA_DIR)
-    print(f"  Extracted → {BIN_DIR}")
+def to_224(img: Image.Image) -> Image.Image:
+    """Đảm bảo RGB + RandomCrop 224×224."""
+    img = img.convert("RGB")
+    # Nếu ảnh nhỏ hơn 224 ở chiều nào đó thì pad trước
+    w, h = img.size
+    if w < CROP_SIZE or h < CROP_SIZE:
+        img = transforms.Resize(CROP_SIZE)(img)
+    return crop(img)
 
 
-# ── 2. Read unlabeled binary ──────────────────────────────────────────────────
-def read_unlabeled_images() -> np.ndarray:
-    """
-    STL-10 binary format:
-      - mỗi ảnh = DEPTH * HEIGHT * WIDTH bytes (uint8, channel-first, column-major)
-      - unlabeled_X.bin chứa 100 000 ảnh liên tiếp
-    """
-    print(f"[2/4] Reading unlabeled_X.bin ...")
-    with open(UNLABELED_BIN, "rb") as f:
-        data = np.frombuffer(f.read(), dtype=np.uint8)
-
-    # reshape → (N, 3, 96, 96)  rồi transpose → (N, 96, 96, 3) HWC
-    n = data.shape[0] // (DEPTH * HEIGHT * WIDTH)
-    images = data.reshape(n, DEPTH, HEIGHT, WIDTH)
-    images = np.transpose(images, (0, 3, 2, 1))   # (N, W, H, C) → đúng HWC
-    # STL-10 lưu column-major (width trước height), transpose lại cho đúng
-    images = np.transpose(images, (0, 2, 1, 3))   # swap H và W
-    print(f"  Loaded {n:,} images  shape={images.shape}")
-    return images
-
-
-# ── 3. Shuffle & split ────────────────────────────────────────────────────────
-def split_indices(n: int):
-    indices = list(range(n))
-    random.seed(SEED)
-    random.shuffle(indices)
-    cut = int(n * TRAIN_RATIO)
-    return indices[:cut], indices[cut:]
-
-
-# ── 4. Save images ────────────────────────────────────────────────────────────
-def save_split(images: np.ndarray, indices: list, split: str):
-    out_dir = DATA_DIR / split
-    out_dir.mkdir(parents=True, exist_ok=True)
-    desc = f"[{'3' if split == 'train' else '4'}/4] Saving {split:5s}"
-    for idx in tqdm(indices, desc=f"  {desc}", unit=" img", dynamic_ncols=True, colour="green"):
-        img_arr = images[idx]                      # (96, 96, 3) uint8
-        img = Image.fromarray(img_arr, mode="RGB")
-        img.save(out_dir / f"{idx:06d}.png")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print("=" * 60)
-    print("  STL-10 Unlabeled → I-JEPA image dataset")
-    print(f"  Output : {DATA_DIR.resolve()}")
-    print("=" * 60 + "\n")
+    print("  ImageNet-1K resized-256 → I-JEPA image dataset (224×224)")
+    print(f"  Source  : {HF_REPO}  [{HF_SPLIT}]")
+    print(f"  Output  : {DATA_DIR.resolve()}")
+    print("=" * 60)
 
-    download_and_extract()
-    images = read_unlabeled_images()
+    # 1. Stream từ HuggingFace
+    print(f"\n[1/4] Connecting to {HF_REPO} (streaming)...")
+    ds = load_dataset(HF_REPO, split=HF_SPLIT, streaming=True)
 
-    n = len(images)
-    train_idx, val_idx = split_indices(n)
-    print(f"\n  Seed={SEED} | Train: {len(train_idx):,}  Val: {len(val_idx):,}\n")
+    # 2. Collect 100K ảnh, crop 224 on-the-fly
+    print(f"[2/4] Downloading & cropping {TOTAL:,} images (224×224)...")
+    records: list[Image.Image] = []
+    with tqdm(total=TOTAL, desc="  Fetching", unit=" img",
+              dynamic_ncols=True, colour="cyan") as pbar:
+        for sample in ds:
+            img = sample["image"]
+            if not isinstance(img, Image.Image):
+                img = Image.fromarray(img)
+            records.append(to_224(img))
+            pbar.update(1)
+            if len(records) >= TOTAL:
+                break
 
-    save_split(images, train_idx, "train")
-    save_split(images, val_idx,   "val")
+    # 3. Shuffle & split
+    print(f"\n[3/4] Shuffling & splitting (seed={SEED})...")
+    indices = list(range(len(records)))
+    random.seed(SEED)
+    random.shuffle(indices)
+
+    cut       = int(len(indices) * TRAIN_RATIO)
+    train_idx = indices[:cut]
+    val_idx   = indices[cut:]
+    print(f"  Train: {len(train_idx):,}  |  Val: {len(val_idx):,}")
+
+    # 4. Lưu ảnh
+    (DATA_DIR / "train").mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "val").mkdir(parents=True, exist_ok=True)
+
+    print(f"\n[4/4] Saving images...")
+    for idx in tqdm(train_idx, desc="  Saving train", unit=" img",
+                    dynamic_ncols=True, colour="green"):
+        records[idx].save(DATA_DIR / "train" / f"{idx:06d}.jpg",
+                          quality=JPEG_Q)
+
+    for idx in tqdm(val_idx, desc="  Saving val  ", unit=" img",
+                    dynamic_ncols=True, colour="yellow"):
+        records[idx].save(DATA_DIR / "val" / f"{idx:06d}.jpg",
+                          quality=JPEG_Q)
 
     print("\n" + "=" * 60)
     print("  Done!")
-    print(f"  data/train/ : {len(train_idx):,} images")
-    print(f"  data/val/   : {len(val_idx):,} images")
+    print(f"  data/train/ : {len(train_idx):,} images  (224×224 JPEG)")
+    print(f"  data/val/   : {len(val_idx):,} images  (224×224 JPEG)")
     print("=" * 60)
 
 
