@@ -277,7 +277,7 @@ def make_c4_dataloader(
     max_length: int = MAX_LENGTH,
     # ── masking ───────────────────────────────────────────────────────────
     max_span_length: int = 5,
-    max_num_spans: int = 8,
+    max_num_spans: int = 5,
     min_num_spans: int = 5,
     seed: int | None = None,   # None = fully random mỗi lần collate (recommended)
     # ── misc ──────────────────────────────────────────────────────────────
@@ -362,7 +362,7 @@ def main():
     BATCH_SIZE      = 4
     NUM_WORKERS     = 0
     MAX_SPAN_LENGTH = 5
-    MAX_NUM_SPANS   = 8
+    MAX_NUM_SPANS   = 5
     MIN_NUM_SPANS   = 5
     MASK_TOKEN_ID   = 103
     # Dùng seed cố định cho smoke test để reproducible
