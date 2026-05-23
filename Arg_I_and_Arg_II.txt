@@ -92,7 +92,7 @@ Argument I được confirm khi và chỉ khi đồng thời observe được:
 METRIC CHÍNH — Training loss theo steps:
   - Log MSE loss của I-JEPA và T-JEPA tại mọi bước (hoặc mỗi N bước)
   - Cùng architecture, cùng hyperparameters, chỉ khác modality
-  - Dataset: ImageNet cho image, Wikipedia/BookCorpus cho text
+  - Dataset: ImageNet cho image, C4 cho text (cả hai khoảng 100K mẫu split 90/10 cho train và val)
   - Normalize loss nếu cần để comparable (hoặc report riêng với chú thích rõ)
 
 METRIC KIỂM SOÁT — Effective rank của Σ_z:
