@@ -5,7 +5,7 @@
 # Format mỗi record: {"id": int, "text": str, "url": str, "timestamp": str}
 #
 # Output mỗi batch (dict):
-#   masked_input_ids       [B, L]   — câu với span → [MASK]
+#   masked_input_ids       [B, L]   — câu với span
 #   masked_attention_mask  [B, L]
 #   masked_token_type_ids  [B, L]
 #   clean_input_ids        [B, L]   — câu gốc
