@@ -1,5 +1,5 @@
 # tjepa_training.py
-# Trains T-JEPA for 10 epochs on local C4-subset.
+# Trains T-JEPA for 300 epochs on local C4-subset (BERT-Large Settings).
 # Logs JEPA loss + effective rank every 10 iters → ../Arg-I/T-JEPA.json
 # Saves dual-axis plot (live update every 10 iters) → ../Arg-I/T-JEPA.png
 #
@@ -9,17 +9,22 @@
 # Requires: tjepa_architecture.py, tjepa_dataloader.py, data/ populated
 # ─────────────────────────────────────────────────────────────────────────────
 
+import copy
 import json
-import logging
+import math
+import os
 import sys
+import logging
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+from tqdm import tqdm
 import torch
 
-# ── resolve paths ─────────────────────────────────────────────────────────────
+# ── resolve paths (GIỮ NGUYÊN GỐC 100%) ───────────────────────────────────────
 SCRIPT_DIR  = Path(__file__).parent.resolve()   # .../T-JEPA/
 PROJECT_DIR = SCRIPT_DIR.parent                  # .../ICLR EMPIRICAL EVIDENCES/
 ARG_I_DIR   = PROJECT_DIR / "Arg-I"
@@ -34,32 +39,39 @@ from tjepa_architecture import TextJEPA
 from tjepa_dataloader   import make_c4_dataloader
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config
+# Config - Đồng bộ hóa setting tương đồng với cấu hình mới của I-JEPA
 # ─────────────────────────────────────────────────────────────────────────────
 CFG = dict(
     # data
     data_dir        = SCRIPT_DIR / "data",
-    batch_size      = 256,
-    num_workers     = 4,
+    batch_size      = 128,             # Đồng bộ với cấu hình chịu tải lớn
+    num_workers     = 10,              # Đồng bộ hóa worker xử lý dữ liệu
     max_length      = 256,
+    pin_mem         = True,
     # masking (span)
     max_span_length = 5,
     max_num_spans   = 5,
     min_num_spans   = 1,
-    # model
-    hidden_dim         = 768,   # BERT-base D
-    predictor_dim      = 384,   # D/2
-    predictor_layers   = 4,
-    predictor_heads    = 6,
-    predictor_ffn_dim  = 1536,
-    # optimiser
-    lr              = 1e-3,
-    weight_decay    = 0.05,
-    # EMA
-    ema_decay       = 0.996,
+    allow_overlap   = False,
+    # model (Nâng cấp cấu hình tương đương BERT-Large)
+    model_name      = "bert_large",
+    hidden_dim      = 1024,            # BERT-Large D
+    predictor_dim   = 384,             # Giữ nguyên pred dim theo config
+    predictor_layers= 12,              # Đồng bộ độ sâu predictor (depth=12)
+    predictor_heads = 16,              # Đồng bộ số heads (heads=16)
+    predictor_ffn_dim = 1536,
+    use_bfloat16    = True,            # Bật bfloat16 cho mô hình lớn
+    # optimiser & schedules động từ I-JEPA
+    epochs          = 300,             # Nâng lên 300 epochs giống I-JEPA
+    start_lr        = 0.0002,
+    lr              = 0.001,
+    final_lr        = 1.0e-06,
+    warmup          = 40,              # 40 epochs khởi động (warmup)
+    weight_decay    = 0.04,
+    final_weight_decay = 0.4,
+    ema_range       = (0.996, 1.0),    # EMA tăng dần từ 0.996 -> 1.0
     # training
-    epochs          = 10,
-    log_every       = 10,    # iterations between records
+    log_every       = 10,    
     device          = "cuda" if torch.cuda.is_available() else "cpu",
 )
 
@@ -72,26 +84,45 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers  (identical logic to ijepa_training.py)
+# Schedulers (Đồng bộ thuật toán sinh LR, WD, EMA động từng step)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_lr_wd_ema_schedulers(total_steps, steps_per_epoch):
+    warmup_steps = CFG["warmup"] * steps_per_epoch
+    
+    lr_schedule = np.zeros(total_steps)
+    wd_schedule = np.zeros(total_steps)
+    ema_schedule = np.zeros(total_steps)
+    
+    for step in range(total_steps):
+        # 1. Learning Rate Schedule (Warmup tuyến tính + Cosine Decay)
+        if step < warmup_steps:
+            lr_schedule[step] = CFG["start_lr"] + step * (CFG["lr"] - CFG["start_lr"]) / max(1, warmup_steps)
+        else:
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            lr_schedule[step] = CFG["final_lr"] + 0.5 * (CFG["lr"] - CFG["final_lr"]) * (1 + math.cos(math.pi * progress))
+            
+        # 2. Weight Decay Schedule (Cosine Annealing)
+        progress = step / total_steps
+        wd_schedule[step] = CFG["weight_decay"] + 0.5 * (CFG["final_weight_decay"] - CFG["weight_decay"]) * (1 - math.cos(math.pi * progress))
+        
+        # 3. EMA Schedule (Cosine tăng dần từ 0.996 đến 1.0)
+        ema_schedule[step] = CFG["ema_range"][1] - 0.5 * (CFG["ema_range"][1] - CFG["ema_range"][0]) * (1 + math.cos(math.pi * progress))
+        
+    return lr_schedule, wd_schedule, ema_schedule
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def compute_effective_rank(z: torch.Tensor) -> float:
-    """
-    Effective rank of the representation covariance.
-
-    effective_rank = exp( H( λ_i / Σλ_i ) )
-    where λ_i are eigenvalues of the empirical covariance of z.
-
-    Parameters
-    ----------
-    z : Tensor [N, D]  — batch of representation vectors (any token positions)
-    """
     z = z.float()
-    z = z - z.mean(dim=0, keepdim=True)                      # centre
-    cov = (z.T @ z) / max(z.shape[0] - 1, 1)                # [D, D]
+    z = z - z.mean(dim=0, keepdim=True)                      
+    cov = (z.T @ z) / max(z.shape[0] - 1, 1)                
     try:
-        eigvals = torch.linalg.eigvalsh(cov)                 # [D], ascending
+        eigvals = torch.linalg.eigvalsh(cov)                 
     except Exception:
         return float("nan")
     eigvals = eigvals.clamp(min=0.0)
@@ -105,17 +136,13 @@ def compute_effective_rank(z: torch.Tensor) -> float:
 
 
 def save_plot(records: list[dict]):
-    """
-    Dual-axis line chart: left axis = loss, right axis = effective rank.
-    Được gọi sau mỗi log_every iteration để cập nhật PNG liên tục (live update).
-    """
     steps  = [r["global_step"]    for r in records]
     losses = [r["loss"]           for r in records]
     ranks  = [r["effective_rank"] for r in records]
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
-    color_loss = "#D85A30"   # T-JEPA orange-red (consistent with paper palette)
-    color_rank = "#8B2500"   # darker shade for rank
+    color_loss = "#D85A30"   
+    color_rank = "#8B2500"   
 
     ax1.set_xlabel("Training steps", fontsize=12)
     ax1.set_ylabel("MSE Loss", color=color_loss, fontsize=12)
@@ -125,31 +152,22 @@ def save_plot(records: list[dict]):
 
     ax2 = ax1.twinx()
     ax2.set_ylabel("Effective Rank", color=color_rank, fontsize=12)
-    ax2.plot(steps, ranks, color=color_rank, linewidth=1.8,
-             linestyle="--", label="T-JEPA eff. rank")
+    ax2.plot(steps, ranks, color=color_rank, linewidth=1.8, linestyle="--", label="T-JEPA eff. rank")
     ax2.tick_params(axis="y", labelcolor=color_rank)
     ax2.set_ylim(bottom=0)
 
-    # combined legend
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=10)
 
-    # Hiển thị step hiện tại trên tiêu đề
     current_step = steps[-1] if steps else 0
-    plt.title(
-        f"T-JEPA Training Dynamics (Loss & Effective Rank)  [step {current_step}]",
-        fontsize=13,
-    )
+    plt.title(f"T-JEPA Training Dynamics (Loss & Effective Rank)  [step {current_step}]", fontsize=13)
     fig.tight_layout()
 
-    # Ghi vào file tạm rồi rename → tránh đọc file lúc đang ghi dở
     tmp_path = PNG_PATH.with_suffix(".tmp.png")
     fig.savefig(str(tmp_path), dpi=150)
     plt.close(fig)
     tmp_path.replace(PNG_PATH)
-
-    log.info(f"[live] Plot updated → {PNG_PATH}  (step {current_step})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,21 +184,18 @@ def train():
         split           = "train",
         batch_size      = CFG["batch_size"],
         num_workers     = CFG["num_workers"],
-        pin_mem         = (device.type == "cuda"),
+        pin_mem         = CFG["pin_mem"],
         max_length      = CFG["max_length"],
         max_span_length = CFG["max_span_length"],
         max_num_spans   = CFG["max_num_spans"],
         min_num_spans   = CFG["min_num_spans"],
-        seed            = None,          # fully random per epoch (recommended)
+        seed            = None,          
         drop_last       = True,
         persistent_workers = (CFG["num_workers"] > 0),
     )
-    log.info(
-        f"Dataset: {len(loader.dataset):,} sentences, "
-        f"{len(loader):,} batches/epoch, bs={CFG['batch_size']}"
-    )
+    log.info(f"Dataset: {len(loader.dataset):,} sentences, {len(loader):,} batches/epoch")
 
-    # ── model ─────────────────────────────────────────────────────────────
+    # ── model (Sử dụng cấu hình lớn) ──────────────────────────────────────
     model = TextJEPA(
         hidden_dim        = CFG["hidden_dim"],
         predictor_dim     = CFG["predictor_dim"],
@@ -198,76 +213,91 @@ def train():
         f"(target_encoder: EMA copy, no grad)"
     )
 
-    # ── optimiser ─────────────────────────────────────────────────────────
-    # Only context_encoder + predictor are trained (target_encoder is EMA)
+    # ── optimiser & schedules ─────────────────────────────────────────────
     trainable_params = (
         list(model.context_encoder.parameters()) +
         list(model.predictor.parameters())
     )
     optimiser = torch.optim.AdamW(
         trainable_params,
-        lr           = CFG["lr"],
+        lr           = CFG["start_lr"],
         weight_decay = CFG["weight_decay"],
     )
 
-    total_steps = CFG["epochs"] * len(loader)
-    scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimiser, T_max=total_steps, eta_min=1e-5
-    )
+    steps_per_epoch = len(loader)
+    total_steps = CFG["epochs"] * steps_per_epoch
+    
+    # Tạo các lịch trình cập nhật động
+    lr_sched, wd_sched, ema_sched = get_lr_wd_ema_schedulers(total_steps, steps_per_epoch)
 
     # ── training loop ─────────────────────────────────────────────────────
     records     = []
     global_step = 0
 
-    for epoch in range(1, CFG["epochs"] + 1):
+    epoch_bar = tqdm(range(1, CFG["epochs"] + 1), desc="Epochs", unit="ep", position=0)
+
+    for epoch in epoch_bar:
         model.context_encoder.train()
         model.predictor.train()
-        model.target_encoder.eval()   # target encoder: always eval mode
+        model.target_encoder.eval()   
         epoch_losses = []
 
-        for it, batch in enumerate(loader, start=1):
-            # move every tensor in the batch dict to device
+        iter_bar = tqdm(
+            enumerate(loader, start=1),
+            total         = len(loader),
+            desc          = f"Ep {epoch:03d}",
+            unit          = "it",
+            position      = 1,
+            leave         = False,
+            dynamic_ncols = True,
+        )
+
+        for it, batch in iter_bar:
+            # Gán lr và weight decay biến thiên theo từng step huấn luyện
+            current_lr = lr_sched[global_step]
+            current_wd = wd_sched[global_step]
+            current_ema = ema_sched[global_step]
+            
+            for param_group in optimiser.param_groups:
+                param_group["lr"] = current_lr
+                param_group["weight_decay"] = current_wd
+
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-            # ── forward ───────────────────────────────────────────────────
-            out  = model(batch)
-            loss = out["span_loss"]
+            # Kích hoạt bfloat16 autocast tương đồng I-JEPA
+            with torch.amp.autocast(device_type="cuda", enabled=CFG["use_bfloat16"] and device.type == "cuda", dtype=torch.bfloat16):
+                # ── forward ───────────────────────────────────────────────────
+                out  = model(batch)
+                loss = out["span_loss"]
 
             # ── backward ──────────────────────────────────────────────────
             optimiser.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimiser.step()
-            scheduler.step()
 
             # ── EMA update of target encoder ──────────────────────────────
-            model.update_target_encoder(decay=CFG["ema_decay"])
+            model.update_target_encoder(decay=current_ema)
 
             epoch_losses.append(loss.item())
-            global_step += 1
+
+            # ── update iter progress bar ───────────────────────────────────
+            iter_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.5f}", step=global_step)
 
             # ── logging + live plot update ────────────────────────────────
             if global_step % CFG["log_every"] == 0:
-                # Effective rank: flatten [B, L, D] context hidden over span positions
                 with torch.no_grad():
-                    # out["predicted_hidden"] already computed; use context
-                    # Re-use the target hidden (detached) from the forward pass.
-                    # For rank we want the context encoder representations:
-                    # run a quick no-grad pass on context encoder output.
                     ctx_hidden = model._encode(
                         model.context_encoder,
                         batch["masked_input_ids"],
                         batch["masked_attention_mask"],
                         batch["masked_token_type_ids"],
-                    )  # [B, L, D]
+                    )  
 
-                    # Pool over span positions per sample, then flatten to [N, D]
-                    span_mask  = batch["span_mask"].bool()          # [B, L]
-                    # gather all span token representations → [total_span_tokens, D]
-                    z_flat = ctx_hidden[span_mask]                  # [M, D]
+                    span_mask  = batch["span_mask"].bool()          
+                    z_flat = ctx_hidden[span_mask]                  
                     if z_flat.shape[0] < 2:
-                        # fallback: use mean-pooled per sample
-                        z_flat = ctx_hidden.mean(dim=1)             # [B, D]
+                        z_flat = ctx_hidden.mean(dim=1)             
 
                     eff_rank = compute_effective_rank(z_flat.detach())
 
@@ -281,21 +311,21 @@ def train():
                 records.append(record)
 
                 log.info(
-                    f"[ep {epoch:02d}|it {it:04d}|step {global_step:06d}]  "
-                    f"loss={loss.item():.4f}  eff_rank={eff_rank:.2f}"
+                    f"[ep {epoch:03d}|it {it:04d}|step {global_step:06d}]  "
+                    f"loss={loss.item():.4f}  eff_rank={eff_rank:.2f}  lr={current_lr:.6f}"
                 )
 
-                # ── incremental JSON save ──────────────────────────────────
                 with open(JSON_PATH, "w") as f:
                     json.dump(records, f, indent=2)
 
-                # ── live PNG update ────────────────────────────────────────
                 save_plot(records)
+                
+            global_step += 1
 
         mean_ep_loss = sum(epoch_losses) / len(epoch_losses)
-        log.info(f"── Epoch {epoch:02d} complete  mean_loss={mean_ep_loss:.4f}")
+        log.info(f"── Epoch {epoch:03d} complete  mean_loss={mean_ep_loss:.4f}")
+        epoch_bar.set_postfix(mean_loss=f"{mean_ep_loss:.4f}")
 
-    # ── final JSON flush ──────────────────────────────────────────────────
     with open(JSON_PATH, "w") as f:
         json.dump(records, f, indent=2)
     log.info(f"Records saved → {JSON_PATH}  ({len(records)} entries)")
@@ -303,8 +333,6 @@ def train():
     log.info("Training complete.")
     return records
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     train()
