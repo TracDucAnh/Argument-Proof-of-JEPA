@@ -36,6 +36,7 @@ ARG_I_DIR.mkdir(parents=True, exist_ok=True)
 
 JSON_PATH = ARG_I_DIR / "T-JEPA.json"
 PNG_PATH  = ARG_I_DIR / "T-JEPA.png"
+CKPT_PATH = ARG_I_DIR / "T-JEPA_latest.pt"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 from tjepa_architecture import TextJEPA, compute_effective_rank
@@ -48,7 +49,7 @@ CFG = dict(
     # data
     data_dir        = SCRIPT_DIR / "data",
     batch_size      = 128,
-    num_workers     = 10,
+    num_workers     = 4,
     max_length      = 256,
     pin_mem         = True,
     # masking (span)
@@ -65,7 +66,7 @@ CFG = dict(
     predictor_ffn_dim = 1536,
     use_bfloat16    = True,
     # optimiser & schedules
-    epochs          = 128,
+    epochs          = 20,
     start_lr        = 0.0002,
     lr              = 0.001,
     final_lr        = 1.0e-06,
@@ -80,7 +81,7 @@ CFG = dict(
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
+    format="%(message)s",
     handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
@@ -157,10 +158,37 @@ def save_plot(records: list[dict]):
         fontsize=12)
     fig.tight_layout()
 
-    tmp_path = PNG_PATH.with_suffix(".tmp.png")
-    fig.savefig(str(tmp_path), dpi=150)
+    fig.savefig(str(PNG_PATH), dpi=100)
     plt.close(fig)
-    tmp_path.replace(PNG_PATH)
+
+# Save ckpt #
+
+def save_checkpoint(
+    path,
+    model,
+    optimiser,
+    epoch,
+    global_step,
+    records,
+    lr_sched,
+    wd_sched,
+    ema_sched,
+):
+    ckpt = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state_dict": model.state_dict(),
+        "optimiser_state_dict": optimiser.state_dict(),
+        "records": records,
+        "config": CFG,
+        "lr_sched": lr_sched,
+        "wd_sched": wd_sched,
+        "ema_sched": ema_sched,
+    }
+
+    tmp_path = path.with_suffix(".tmp.pt")
+    torch.save(ckpt, tmp_path)
+    tmp_path.replace(path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,7 +212,7 @@ def train():
         min_num_spans   = CFG["min_num_spans"],
         seed            = 42,
         drop_last       = True,
-        persistent_workers = (CFG["num_workers"] > 0),
+        persistent_workers = False,
     )
     log.info(f"Dataset: {len(loader.dataset):,} sentences, {len(loader):,} batches/epoch")
 
@@ -298,13 +326,31 @@ def train():
                 with open(JSON_PATH, "w") as f:
                     json.dump(records, f, indent=2)
 
-                save_plot(records)
+                try:
+                    save_plot(records)
+                except OSError as e:
+                    log.warning(f"save_plot failed (disk/IO error): {e} — skipping plot this step")
 
             global_step += 1
 
         mean_ep_loss = sum(epoch_losses) / len(epoch_losses)
         log.info(f"── Epoch {epoch:03d} complete  mean_loss={mean_ep_loss:.4f}")
         epoch_bar.set_postfix(mean_loss=f"{mean_ep_loss:.4f}")
+
+        log.info("About to save latest checkpoint...")
+        save_checkpoint(
+            CKPT_PATH,
+            model,
+            optimiser,
+            epoch,
+            global_step,
+            records,
+            lr_sched,
+            wd_sched,
+            ema_sched,
+        )
+        
+        log.info(f"Latest checkpoint saved → {CKPT_PATH}")
 
     with open(JSON_PATH, "w") as f:
         json.dump(records, f, indent=2)

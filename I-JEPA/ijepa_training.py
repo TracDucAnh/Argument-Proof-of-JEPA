@@ -9,7 +9,8 @@
 #   • Logs 3 rank metrics: effective_rank, normalized_rank, participation_ratio
 #   • JSON schema extended with all 3 metrics for cross-model plotting
 #   • Dual-axis plot now shows normalized_rank (0–1) on right axis
-#   • Output files: ../Arg-I/I-JEPA.json  and  ../Arg-I/I-JEPA.png  (unchanged)
+#   • Checkpoint saving mirrors T-JEPA exactly (atomic tmp→replace, full state)
+#   • Output files: ../Arg-I/I-JEPA.json  and  ../Arg-I/I-JEPA.png
 #
 # Usage (run from I-JEPA/ directory):
 #   python ijepa_training.py
@@ -38,6 +39,7 @@ ARG_I_DIR.mkdir(parents=True, exist_ok=True)
 
 JSON_PATH = ARG_I_DIR / "I-JEPA.json"
 PNG_PATH  = ARG_I_DIR / "I-JEPA.png"
+CKPT_PATH = ARG_I_DIR / "I-JEPA_latest.pt"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 from ijepa_architecture import (
@@ -87,7 +89,7 @@ CFG = dict(
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
+    format="%(message)s",
     handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
@@ -138,22 +140,21 @@ def ema_update(online: torch.nn.Module, target: torch.nn.Module, tau: float):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plot — normalized_rank on right axis for fair comparison with T-JEPA
+# Plot — normalized_rank (0–1) on right axis, directly comparable to T-JEPA
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_plot(records: list[dict]):
     steps  = [r["global_step"]    for r in records]
     losses = [r["loss"]           for r in records]
-    nranks = [r["normalized_rank"] for r in records]   # 0–1, comparable across models
+    nranks = [r["normalized_rank"] for r in records]
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
     color_loss = "#378ADD"
     color_rank = "#D85A30"
 
     ax1.set_xlabel("Training steps", fontsize=12)
-    ax1.set_ylabel("MSE Loss (log scale)", color=color_loss, fontsize=12)
+    ax1.set_ylabel("MSE Loss", color=color_loss, fontsize=12)
     ax1.plot(steps, losses, color=color_loss, linewidth=1.8, label="I-JEPA loss")
-    ax1.set_yscale("log")
     ax1.tick_params(axis="y", labelcolor=color_loss)
 
     ax2 = ax1.twinx()
@@ -174,10 +175,49 @@ def save_plot(records: list[dict]):
         fontsize=12)
     fig.tight_layout()
 
+    # atomic write — mirrors T-JEPA's approach
     tmp_path = PNG_PATH.with_suffix(".tmp.png")
     fig.savefig(str(tmp_path), dpi=150)
     plt.close(fig)
     tmp_path.replace(PNG_PATH)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Checkpoint — mirrors T-JEPA exactly
+# Difference from T-JEPA: I-JEPA has three separate modules instead of one
+# model object, so each is saved under its own key.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_checkpoint(
+    path,
+    context_encoder,
+    predictor,
+    target_encoder,
+    optimiser,
+    epoch,
+    global_step,
+    records,
+    lr_sched,
+    wd_sched,
+    ema_sched,
+):
+    ckpt = {
+        "epoch":                 epoch,
+        "global_step":           global_step,
+        "context_encoder_state": context_encoder.state_dict(),
+        "predictor_state":       predictor.state_dict(),
+        "target_encoder_state":  target_encoder.state_dict(),
+        "optimiser_state_dict":  optimiser.state_dict(),
+        "records":               records,
+        "config":                CFG,
+        "lr_sched":              lr_sched,
+        "wd_sched":              wd_sched,
+        "ema_sched":             ema_sched,
+    }
+
+    tmp_path = path.with_suffix(".tmp.pt")
+    torch.save(ckpt, tmp_path)
+    tmp_path.replace(path)      # atomic on POSIX, best-effort on Windows
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,9 +269,12 @@ def train():
         num_heads           = CFG["pred_heads"],
     ).to(device)
 
+    ctx_params  = sum(p.numel() for p in context_encoder.parameters()) / 1e6
+    pred_params = sum(p.numel() for p in predictor.parameters())       / 1e6
     log.info(
-        f"Params — encoder: {sum(p.numel() for p in context_encoder.parameters())/1e6:.1f}M  "
-        f"predictor: {sum(p.numel() for p in predictor.parameters())/1e6:.1f}M"
+        f"Params — context_encoder: {ctx_params:.1f}M  "
+        f"predictor: {pred_params:.1f}M  "
+        f"(target_encoder: EMA copy, no grad)"
     )
 
     # ── optimiser & schedules ─────────────────────────────────────────────
@@ -252,6 +295,7 @@ def train():
     for epoch in epoch_bar:
         context_encoder.train()
         predictor.train()
+        target_encoder.eval()
         epoch_losses = []
 
         iter_bar = tqdm(
@@ -306,21 +350,23 @@ def train():
             if global_step % CFG["log_every"] == 0:
                 with torch.no_grad():
                     # FAIR: use ALL patches (no masking) for rank computation
-                    z_all = context_encoder.forward_all_patches(imgs)   # [B, N, D]
-                    z_flat = z_all.detach().reshape(-1, CFG["embed_dim"])
+                    # mirrors T-JEPA's encode_full_sequence() approach
+                    # Images have no padding → no mask needed, all patches are real
+                    z_all  = context_encoder.forward_all_patches(imgs)   # [B, N, D]
+                    z_flat = z_all.detach().reshape(-1, CFG["embed_dim"]) # [B*N, D]
                     rank_info = compute_effective_rank(z_flat, embed_dim=CFG["embed_dim"])
 
                 record = dict(
-                    global_step        = global_step,
-                    epoch              = epoch,
-                    iter               = it,
-                    loss               = round(loss.item(), 6),
+                    global_step         = global_step,
+                    epoch               = epoch,
+                    iter                = it,
+                    loss                = round(loss.item(), 6),
                     # ── 3 rank metrics (all logged for cross-model comparison) ──
-                    effective_rank     = round(rank_info["effective_rank"],      4),
-                    normalized_rank    = round(rank_info["normalized_rank"],     6),
-                    participation_ratio= round(rank_info["participation_ratio"], 4),
-                    embed_dim          = CFG["embed_dim"],
-                    model              = "I-JEPA",
+                    effective_rank      = round(rank_info["effective_rank"],      4),
+                    normalized_rank     = round(rank_info["normalized_rank"],     6),
+                    participation_ratio = round(rank_info["participation_ratio"], 4),
+                    embed_dim           = CFG["embed_dim"],
+                    model               = "I-JEPA",
                 )
                 records.append(record)
 
@@ -336,7 +382,10 @@ def train():
                 with open(JSON_PATH, "w") as f:
                     json.dump(records, f, indent=2)
 
-                save_plot(records)
+                try:
+                    save_plot(records)
+                except OSError as e:
+                    log.warning(f"save_plot failed (disk/IO error): {e} — skipping plot this step")
 
             global_step += 1
 
@@ -344,9 +393,26 @@ def train():
         log.info(f"── Epoch {epoch:03d} complete  mean_loss={mean_ep_loss:.4f}")
         epoch_bar.set_postfix(mean_loss=f"{mean_ep_loss:.4f}")
 
+        log.info("About to save latest checkpoint...")
+        save_checkpoint(
+            CKPT_PATH,
+            context_encoder,
+            predictor,
+            target_encoder,
+            optimiser,
+            epoch,
+            global_step,
+            records,
+            lr_sched,
+            wd_sched,
+            ema_sched,
+        )
+        log.info(f"Latest checkpoint saved → {CKPT_PATH}")
+
     with open(JSON_PATH, "w") as f:
         json.dump(records, f, indent=2)
-    log.info(f"Final records saved → {JSON_PATH}")
+    log.info(f"Records saved → {JSON_PATH}  ({len(records)} entries)")
+    log.info("Training complete.")
     return records
 
 
