@@ -47,7 +47,7 @@ from tjepa_dataloader   import make_c4_dataloader
 CFG = dict(
     # data
     data_dir        = SCRIPT_DIR / "data",
-    batch_size      = 32,
+    batch_size      = 128,
     num_workers     = 10,
     max_length      = 256,
     pin_mem         = True,
