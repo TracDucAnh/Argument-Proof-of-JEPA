@@ -1,18 +1,23 @@
-# ijepa_training.py
-# Trains I-JEPA for 300 epochs on local ImageNet-1K subset.
-# Logs JEPA loss + effective rank every 10 iters → ../Arg-I/I-JEPA.json
-# Saves dual-axis plot (live update every 10 iters) → ../Arg-I/I-JEPA.png
+# ijepa_training.py  (fair-comparison edition)
+# ─────────────────────────────────────────────────────────────────────────────
+# Trains I-JEPA for N epochs on local ImageNet-1K subset.
+# Logs JEPA loss + FAIR effective rank metrics every log_every iters.
+#
+# FAIR COMPARISON CHANGES vs. original:
+#   • Effective rank computed from ALL patches (forward_all_patches), not just
+#     context tokens  → apples-to-apples with T-JEPA's full-sequence approach
+#   • Logs 3 rank metrics: effective_rank, normalized_rank, participation_ratio
+#   • JSON schema extended with all 3 metrics for cross-model plotting
+#   • Dual-axis plot now shows normalized_rank (0–1) on right axis
+#   • Output files: ../Arg-I/I-JEPA.json  and  ../Arg-I/I-JEPA.png  (unchanged)
 #
 # Usage (run from I-JEPA/ directory):
 #   python ijepa_training.py
-#
-# Requires: ijepa_architecture.py, ijepa_dataloader.py, data/ populated
 # ─────────────────────────────────────────────────────────────────────────────
 
 import copy
 import json
 import math
-import os
 import sys
 import logging
 from pathlib import Path
@@ -25,7 +30,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 
-# ── resolve paths (GIỮ NGUYÊN GỐC 100%) ───────────────────────────────────────
+# ── resolve paths ─────────────────────────────────────────────────────────────
 SCRIPT_DIR  = Path(__file__).parent.resolve()   # .../I-JEPA/
 PROJECT_DIR = SCRIPT_DIR.parent                  # .../ICLR EMPIRICAL EVIDENCES/
 ARG_I_DIR   = PROJECT_DIR / "Arg-I"
@@ -34,17 +39,18 @@ ARG_I_DIR.mkdir(parents=True, exist_ok=True)
 JSON_PATH = ARG_I_DIR / "I-JEPA.json"
 PNG_PATH  = ARG_I_DIR / "I-JEPA.png"
 
-# ── make sure sibling modules are importable ──────────────────────────────────
 sys.path.insert(0, str(SCRIPT_DIR))
-from ijepa_architecture import vit_huge, vit_predictor
-from ijepa_dataloader   import make_imagenet1k_dataloader
+from ijepa_architecture import (
+    vit_huge, vit_predictor, compute_effective_rank
+)
+from ijepa_dataloader import make_imagenet1k_dataloader
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config - Cập nhật theo file thông số mới
+# Config
 # ─────────────────────────────────────────────────────────────────────────────
 CFG = dict(
     # data
-    data_dir        = SCRIPT_DIR / "data", # Giữ nguyên cấu trúc thư mục data gốc
+    data_dir        = SCRIPT_DIR / "data",
     batch_size      = 128,
     num_workers     = 10,
     crop_size       = 224,
@@ -58,7 +64,7 @@ CFG = dict(
     num_pred_masks  = 4,
     min_keep        = 10,
     allow_overlap   = False,
-    # model (Cấu hình vit_huge)
+    # model
     model_name      = "vit_huge",
     embed_dim       = 1280,   # ViT-H
     pred_embed_dim  = 384,
@@ -70,12 +76,12 @@ CFG = dict(
     start_lr        = 0.0002,
     lr              = 0.001,
     final_lr        = 1.0e-06,
-    warmup          = 40,     # epochs warmup
+    warmup          = 40,
     weight_decay    = 0.04,
     final_weight_decay = 0.4,
     ema_range       = (0.996, 1.0),
     # training
-    log_every       = 10,    
+    log_every       = 10,
     device          = "cuda" if torch.cuda.is_available() else "cpu",
 )
 
@@ -88,56 +94,42 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Schedulers (LR & WD & EMA)
+# Schedulers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_lr_wd_ema_schedulers(total_steps, steps_per_epoch):
     warmup_steps = CFG["warmup"] * steps_per_epoch
-    
-    lr_schedule = np.zeros(total_steps)
-    wd_schedule = np.zeros(total_steps)
+    lr_schedule  = np.zeros(total_steps)
+    wd_schedule  = np.zeros(total_steps)
     ema_schedule = np.zeros(total_steps)
-    
+
     for step in range(total_steps):
-        # LR Schedule (Warmup + Cosine)
+        # LR: linear warmup → cosine decay
         if step < warmup_steps:
-            lr_schedule[step] = CFG["start_lr"] + step * (CFG["lr"] - CFG["start_lr"]) / max(1, warmup_steps)
+            lr_schedule[step] = (CFG["start_lr"]
+                + step * (CFG["lr"] - CFG["start_lr"]) / max(1, warmup_steps))
         else:
             progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            lr_schedule[step] = CFG["final_lr"] + 0.5 * (CFG["lr"] - CFG["final_lr"]) * (1 + math.cos(math.pi * progress))
-            
-        # Weight Decay Schedule (Cosine)
+            lr_schedule[step] = (CFG["final_lr"]
+                + 0.5 * (CFG["lr"] - CFG["final_lr"]) * (1 + math.cos(math.pi * progress)))
+
+        # WD: cosine annealing
         progress = step / total_steps
-        wd_schedule[step] = CFG["weight_decay"] + 0.5 * (CFG["final_weight_decay"] - CFG["weight_decay"]) * (1 - math.cos(math.pi * progress))
-        
-        # EMA Schedule (Cosine tăng dần từ 0.996 -> 1.0)
-        ema_schedule[step] = CFG["ema_range"][1] - 0.5 * (CFG["ema_range"][1] - CFG["ema_range"][0]) * (1 + math.cos(math.pi * progress))
-        
+        wd_schedule[step] = (CFG["weight_decay"]
+            + 0.5 * (CFG["final_weight_decay"] - CFG["weight_decay"])
+            * (1 - math.cos(math.pi * progress)))
+
+        # EMA: cosine increase 0.996 → 1.0
+        ema_schedule[step] = (CFG["ema_range"][1]
+            - 0.5 * (CFG["ema_range"][1] - CFG["ema_range"][0])
+            * (1 + math.cos(math.pi * progress)))
+
     return lr_schedule, wd_schedule, ema_schedule
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers (Giữ nguyên gốc)
+# EMA update
 # ─────────────────────────────────────────────────────────────────────────────
-
-@torch.no_grad()
-def compute_effective_rank(z: torch.Tensor) -> float:
-    z = z.float()
-    z = z - z.mean(dim=0, keepdim=True)
-    cov = (z.T @ z) / max(z.shape[0] - 1, 1)
-    try:
-        eigvals = torch.linalg.eigvalsh(cov)          
-    except Exception:
-        return float("nan")
-    eigvals = eigvals.clamp(min=0.0)
-    total   = eigvals.sum()
-    if total < 1e-12:
-        return 1.0
-    p    = eigvals / total                             
-    mask = p > 1e-12
-    H    = -(p[mask] * torch.log(p[mask])).sum()
-    return float(torch.exp(H).item())
-
 
 @torch.no_grad()
 def ema_update(online: torch.nn.Module, target: torch.nn.Module, tau: float):
@@ -145,33 +137,41 @@ def ema_update(online: torch.nn.Module, target: torch.nn.Module, tau: float):
         p_t.data.mul_(tau).add_(p_o.data, alpha=1.0 - tau)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot — normalized_rank on right axis for fair comparison with T-JEPA
+# ─────────────────────────────────────────────────────────────────────────────
+
 def save_plot(records: list[dict]):
-    steps  = [r["global_step"] for r in records]
+    steps  = [r["global_step"]    for r in records]
     losses = [r["loss"]           for r in records]
-    ranks  = [r["effective_rank"] for r in records]
+    nranks = [r["normalized_rank"] for r in records]   # 0–1, comparable across models
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
     color_loss = "#378ADD"
     color_rank = "#D85A30"
 
     ax1.set_xlabel("Training steps", fontsize=12)
-    ax1.set_ylabel("MSE Loss", color=color_loss, fontsize=12)
+    ax1.set_ylabel("MSE Loss (log scale)", color=color_loss, fontsize=12)
     ax1.plot(steps, losses, color=color_loss, linewidth=1.8, label="I-JEPA loss")
+    ax1.set_yscale("log")
     ax1.tick_params(axis="y", labelcolor=color_loss)
-    ax1.set_ylim(bottom=0)
 
     ax2 = ax1.twinx()
-    ax2.set_ylabel("Effective Rank", color=color_rank, fontsize=12)
-    ax2.plot(steps, ranks, color=color_rank, linewidth=1.8, linestyle="--", label="I-JEPA eff. rank")
+    ax2.set_ylabel("Normalized Effective Rank  (rank / embed_dim)", color=color_rank, fontsize=12)
+    ax2.plot(steps, nranks, color=color_rank, linewidth=1.8, linestyle="--",
+             label="I-JEPA norm. eff. rank")
     ax2.tick_params(axis="y", labelcolor=color_rank)
-    ax2.set_ylim(bottom=0)
+    ax2.set_ylim(0, 1)   # fixed 0–1 range → directly comparable with T-JEPA plot
 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=10)
 
     current_step = steps[-1] if steps else 0
-    plt.title(f"I-JEPA Training Dynamics (Loss & Effective Rank)  [step {current_step}]", fontsize=13)
+    plt.title(
+        f"I-JEPA Training Dynamics  [step {current_step}]\n"
+        f"(right axis: normalized rank = eff_rank / {CFG['embed_dim']}  →  0–1)",
+        fontsize=12)
     fig.tight_layout()
 
     tmp_path = PNG_PATH.with_suffix(".tmp.png")
@@ -209,9 +209,9 @@ def train():
     )
     log.info(f"Dataset: {len(loader.dataset):,} images, {len(loader):,} batches/epoch")
 
-    N_PATCHES = (CFG["crop_size"] // CFG["patch_size"]) ** 2   # (224 // 14)^2 = 256
+    N_PATCHES = (CFG["crop_size"] // CFG["patch_size"]) ** 2
 
-    # ── models (Đổi sang vit_huge) ─────────────────────────────────────────
+    # ── models ────────────────────────────────────────────────────────────
     context_encoder = vit_huge(
         patch_size = CFG["patch_size"],
         img_size   = [CFG["crop_size"]],
@@ -235,20 +235,17 @@ def train():
     )
 
     # ── optimiser & schedules ─────────────────────────────────────────────
-    params = list(context_encoder.parameters()) + list(predictor.parameters())
-    optimiser = torch.optim.AdamW(
-        params, lr=CFG["start_lr"], weight_decay=CFG["weight_decay"]
-    )
+    params    = list(context_encoder.parameters()) + list(predictor.parameters())
+    optimiser = torch.optim.AdamW(params, lr=CFG["start_lr"],
+                                  weight_decay=CFG["weight_decay"])
 
     steps_per_epoch = len(loader)
-    total_steps = CFG["epochs"] * steps_per_epoch
-    
-    # Sinh mảng giá trị lr, wd, ema động từng step
+    total_steps     = CFG["epochs"] * steps_per_epoch
     lr_sched, wd_sched, ema_sched = get_lr_wd_ema_schedulers(total_steps, steps_per_epoch)
 
     # ── training loop ─────────────────────────────────────────────────────
-    records      = []
-    global_step  = 0
+    records     = []
+    global_step = 0
 
     epoch_bar = tqdm(range(1, CFG["epochs"] + 1), desc="Epochs", unit="ep", position=0)
 
@@ -259,88 +256,88 @@ def train():
 
         iter_bar = tqdm(
             enumerate(loader, start=1),
-            total         = len(loader),
-            desc          = f"Ep {epoch:03d}",
-            unit          = "it",
-            position      = 1,
-            leave         = False,
-            dynamic_ncols = True,
+            total=len(loader), desc=f"Ep {epoch:03d}", unit="it",
+            position=1, leave=False, dynamic_ncols=True,
         )
 
         for it, (imgs, masks_enc, masks_pred) in iter_bar:
-            # Gán lr và weight decay động theo đúng step hiện hành
-            current_lr = lr_sched[global_step]
-            current_wd = wd_sched[global_step]
+            current_lr  = lr_sched[global_step]
+            current_wd  = wd_sched[global_step]
             current_ema = ema_sched[global_step]
-            
-            for param_group in optimiser.param_groups:
-                param_group["lr"] = current_lr
-                param_group["weight_decay"] = current_wd
+
+            for pg in optimiser.param_groups:
+                pg["lr"]           = current_lr
+                pg["weight_decay"] = current_wd
 
             imgs       = imgs.to(device, non_blocking=True)
-            masks_enc  = masks_enc.to(device,  non_blocking=True)   
-            masks_pred = masks_pred.to(device, non_blocking=True)   
+            masks_enc  = masks_enc.to(device,  non_blocking=True)
+            masks_pred = masks_pred.to(device, non_blocking=True)
 
             masks_enc_flat  = masks_enc[:, 0, :]
             masks_pred_list = [masks_pred[:, k, :] for k in range(masks_pred.shape[1])]
 
-            # Tính toán amp autocast dạng bfloat16 nếu cấu hình bật
-            with torch.amp.autocast(device_type="cuda", enabled=CFG["use_bfloat16"] and device.type == "cuda", dtype=torch.bfloat16):
-                # ── target representations (no grad) ──────────────────────────
+            with torch.amp.autocast(device_type="cuda",
+                                    enabled=CFG["use_bfloat16"] and device.type == "cuda",
+                                    dtype=torch.bfloat16):
+
                 with torch.no_grad():
-                    z_target_full = target_encoder(imgs)   
+                    z_target_full = target_encoder(imgs)
                     z_targets = []
                     for m in masks_pred_list:
-                        idx  = m.unsqueeze(-1).expand(-1, -1, CFG["embed_dim"])
+                        idx = m.unsqueeze(-1).expand(-1, -1, CFG["embed_dim"])
                         z_targets.append(torch.gather(z_target_full, 1, idx))
                     z_target_cat = torch.cat(z_targets, dim=0)
 
-                # ── context encoder ───────────────────────────────────────────
-                z_ctx = context_encoder(imgs, masks=masks_enc_flat)   
-
-                # ── predictor ─────────────────────────────────────────────────
+                z_ctx  = context_encoder(imgs, masks=masks_enc_flat)
                 z_pred = predictor(z_ctx, masks_x=masks_enc_flat, masks=masks_pred_list)
-
-                # ── JEPA loss ─────────────────────────────────────────────────
-                loss = F.mse_loss(z_pred, z_target_cat)
+                loss   = F.mse_loss(z_pred, z_target_cat)
 
             optimiser.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             optimiser.step()
-
-            # ── EMA target encoder update ─────────────────────────────────
             ema_update(context_encoder, target_encoder, current_ema)
 
             epoch_losses.append(loss.item())
-            
-            iter_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.5f}", step=global_step)
+            iter_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.5f}",
+                                 step=global_step)
 
-            # ── logging + live plot update ────────────────────────────────
+            # ── logging ────────────────────────────────────────────────────
             if global_step % CFG["log_every"] == 0:
                 with torch.no_grad():
-                    z_flat = z_ctx.detach().reshape(-1, CFG["embed_dim"])
-                    eff_rank = compute_effective_rank(z_flat)
+                    # FAIR: use ALL patches (no masking) for rank computation
+                    z_all = context_encoder.forward_all_patches(imgs)   # [B, N, D]
+                    z_flat = z_all.detach().reshape(-1, CFG["embed_dim"])
+                    rank_info = compute_effective_rank(z_flat, embed_dim=CFG["embed_dim"])
 
                 record = dict(
-                    global_step    = global_step,
-                    epoch          = epoch,
-                    iter           = it,
-                    loss           = round(loss.item(), 6),
-                    effective_rank = round(eff_rank, 4),
+                    global_step        = global_step,
+                    epoch              = epoch,
+                    iter               = it,
+                    loss               = round(loss.item(), 6),
+                    # ── 3 rank metrics (all logged for cross-model comparison) ──
+                    effective_rank     = round(rank_info["effective_rank"],      4),
+                    normalized_rank    = round(rank_info["normalized_rank"],     6),
+                    participation_ratio= round(rank_info["participation_ratio"], 4),
+                    embed_dim          = CFG["embed_dim"],
+                    model              = "I-JEPA",
                 )
                 records.append(record)
 
                 log.info(
                     f"[ep {epoch:03d}|it {it:04d}|step {global_step:06d}]  "
-                    f"loss={loss.item():.4f}  eff_rank={eff_rank:.2f}  lr={current_lr:.6f}"
+                    f"loss={loss.item():.4f}  "
+                    f"eff_rank={rank_info['effective_rank']:.2f}  "
+                    f"norm_rank={rank_info['normalized_rank']:.4f}  "
+                    f"pr={rank_info['participation_ratio']:.2f}  "
+                    f"lr={current_lr:.6f}"
                 )
 
                 with open(JSON_PATH, "w") as f:
                     json.dump(records, f, indent=2)
 
                 save_plot(records)
-                
+
             global_step += 1
 
         mean_ep_loss = sum(epoch_losses) / len(epoch_losses)
