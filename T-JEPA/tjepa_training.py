@@ -44,7 +44,7 @@ from tjepa_dataloader   import make_c4_dataloader
 CFG = dict(
     # data
     data_dir        = SCRIPT_DIR / "data",
-    batch_size      = 128,             # Đồng bộ với cấu hình chịu tải lớn
+    batch_size      = 32,             # Đồng bộ với cấu hình chịu tải lớn
     num_workers     = 10,              # Đồng bộ hóa worker xử lý dữ liệu
     max_length      = 256,
     pin_mem         = True,
@@ -62,7 +62,7 @@ CFG = dict(
     predictor_ffn_dim = 1536,
     use_bfloat16    = True,            # Bật bfloat16 cho mô hình lớn
     # optimiser & schedules động từ I-JEPA
-    epochs          = 300,             # Nâng lên 300 epochs giống I-JEPA
+    epochs          = 128,             # Nâng lên 300 epochs giống I-JEPA
     start_lr        = 0.0002,
     lr              = 0.001,
     final_lr        = 1.0e-06,
@@ -141,14 +141,14 @@ def save_plot(records: list[dict]):
     ranks  = [r["effective_rank"] for r in records]
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
-    color_loss = "#D85A30"   
-    color_rank = "#8B2500"   
+    color_loss = "#D85A30"
+    color_rank = "#8B2500"
 
     ax1.set_xlabel("Training steps", fontsize=12)
-    ax1.set_ylabel("MSE Loss", color=color_loss, fontsize=12)
+    ax1.set_ylabel("MSE Loss (log scale)", color=color_loss, fontsize=12)
     ax1.plot(steps, losses, color=color_loss, linewidth=1.8, label="T-JEPA loss")
+    ax1.set_yscale("log")
     ax1.tick_params(axis="y", labelcolor=color_loss)
-    ax1.set_ylim(bottom=0)
 
     ax2 = ax1.twinx()
     ax2.set_ylabel("Effective Rank", color=color_rank, fontsize=12)
@@ -189,7 +189,7 @@ def train():
         max_span_length = CFG["max_span_length"],
         max_num_spans   = CFG["max_num_spans"],
         min_num_spans   = CFG["min_num_spans"],
-        seed            = None,          
+        seed            = 42,          
         drop_last       = True,
         persistent_workers = (CFG["num_workers"] > 0),
     )
@@ -197,6 +197,7 @@ def train():
 
     # ── model (Sử dụng cấu hình lớn) ──────────────────────────────────────
     model = TextJEPA(
+        model_name        = CFG["model_name"],
         hidden_dim        = CFG["hidden_dim"],
         predictor_dim     = CFG["predictor_dim"],
         predictor_layers  = CFG["predictor_layers"],

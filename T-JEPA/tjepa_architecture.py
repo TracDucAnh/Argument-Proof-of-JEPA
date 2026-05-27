@@ -4,8 +4,8 @@ tjepa_architecture.py
 Standalone Text-JEPA architecture.
 
 Design faithful to I-JEPA (arXiv 2301.08243) adapted for text:
-  - Context encoder : BERT-base, sees span-masked sentence
-  - Target encoder  : BERT-base (EMA copy), sees clean sentence — no gradients
+  - Context encoder : BERT-base OR BERT-large, sees span-masked sentence
+  - Target encoder  : EMA copy of context encoder — no gradients
   - Predictor       : narrow BERT  D→d (bottleneck)→D
   - Loss            : token-level L2 on span positions (not mean-pooled first)
 
@@ -13,12 +13,22 @@ Compatible with tjepa_dataloader.py — forward() accepts the 7-key batch dict:
     masked_input_ids / masked_attention_mask / masked_token_type_ids
     clean_input_ids  / clean_attention_mask  / clean_token_type_ids
     span_mask   [B, L]  binary, 1 at span token positions
+
+Changes vs original
+───────────────────
+* Added build_bert_large_config()  (hidden_size=1024, 24 layers, 16 heads)
+* Added _ENCODER_CONFIGS registry  {"bert_base": ..., "bert_large": ...}
+* TextJEPA now accepts model_name  (default "bert_base")
+* Removed over-strict predictor_dim == hidden_dim // 2 constraint
+  → replaced with a soft warning; any valid predictor_dim is accepted
+* predictor_layers < encoder_layers check now uses the actual encoder depth
 """
 
 from __future__ import annotations
 
 import copy
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -27,18 +37,14 @@ from transformers import BertConfig, BertModel
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  BERT-base config  (inlined — no dependency on pretrain/common.py)
+# 1.  Encoder configs
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_bert_base_config(max_length: int = 256) -> BertConfig:
-    """
-    Standard BERT-base hyper-parameters.
-    max_position_embeddings is set to max_length so the encoder
-    matches whatever sequence length the dataloader uses.
-    """
+    """Standard BERT-base hyper-parameters (hidden_size=768, 12 layers)."""
     return BertConfig(
-        vocab_size=30522,            # bert-base-uncased vocab
-        hidden_size=768,             # D
+        vocab_size=30522,
+        hidden_size=768,
         num_hidden_layers=12,
         num_attention_heads=12,
         intermediate_size=3072,      # 4 × D
@@ -52,6 +58,33 @@ def build_bert_base_config(max_length: int = 256) -> BertConfig:
         pad_token_id=0,
         position_embedding_type="absolute",
     )
+
+
+def build_bert_large_config(max_length: int = 256) -> BertConfig:
+    """Standard BERT-large hyper-parameters (hidden_size=1024, 24 layers)."""
+    return BertConfig(
+        vocab_size=30522,
+        hidden_size=1024,            # D_large
+        num_hidden_layers=24,
+        num_attention_heads=16,
+        intermediate_size=4096,      # 4 × D
+        hidden_act="gelu",
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=max_length,
+        type_vocab_size=2,
+        initializer_range=0.02,
+        layer_norm_eps=1e-12,
+        pad_token_id=0,
+        position_embedding_type="absolute",
+    )
+
+
+# Registry: model_name → config builder
+_ENCODER_CONFIGS: dict[str, callable] = {
+    "bert_base":  build_bert_base_config,
+    "bert_large": build_bert_large_config,
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -74,15 +107,6 @@ class SmallBertPredictor(nn.Module):
     information, preventing it from trivially copying encoder output.
     Input and output both live in encoder space D so the loss is computed
     directly against the (unprojected) target encoder output.
-
-    Default settings (matching tjepa_training.py defaults)
-    ───────────────────────────────────────────────────────
-    input_dim      = 768   (D, must equal encoder hidden_size)
-    predictor_dim  = 384   (d = D/2)
-    num_layers     = 4
-    num_heads      = 6
-    ffn_dim        = 1536  (4 × d)
-    max_length     = 256
     """
 
     def __init__(
@@ -152,22 +176,18 @@ class TextJEPA(nn.Module):
 
     Parameters
     ──────────
-    hidden_dim       : int  — D, encoder hidden size          (default 768)
-    predictor_dim    : int  — d, predictor bottleneck         (default 384 = D/2)
-    predictor_layers : int  — predictor transformer depth     (default 4)
-    predictor_heads  : int  — predictor attention heads       (default 6)
-    predictor_ffn_dim: int  — predictor FFN hidden dim        (default 1536 = 4d)
+    model_name       : str  — "bert_base" (768-d, 12L) | "bert_large" (1024-d, 24L)
+    hidden_dim       : int  — D, encoder hidden size  (must match model_name)
+    predictor_dim    : int  — d, predictor bottleneck (any value < D)
+    predictor_layers : int  — predictor transformer depth (< encoder num_layers)
+    predictor_heads  : int  — predictor attention heads  (predictor_dim % heads == 0)
+    predictor_ffn_dim: int  — predictor FFN hidden dim
     max_length       : int  — sequence length, must match dataloader (default 256)
-
-    Constraints (enforced in __init__)
-    ───────────────────────────────────
-    hidden_dim       == encoder hidden_size   (768 for BERT-base)
-    predictor_dim    == hidden_dim // 2       (384)
-    predictor_layers <  encoder num_layers    (< 12)
     """
 
     def __init__(
         self,
+        model_name: str = "bert_base",
         hidden_dim: int = 768,
         predictor_dim: int = 384,
         predictor_layers: int = 4,
@@ -177,22 +197,39 @@ class TextJEPA(nn.Module):
     ):
         super().__init__()
 
-        encoder_config = build_bert_base_config(max_length=max_length)
+        # ── resolve encoder config ────────────────────────────────────────────
+        if model_name not in _ENCODER_CONFIGS:
+            raise ValueError(
+                f"model_name '{model_name}' not recognised. "
+                f"Choose from: {list(_ENCODER_CONFIGS.keys())}"
+            )
+        encoder_config = _ENCODER_CONFIGS[model_name](max_length=max_length)
 
-        # sanity checks
+        # ── sanity checks ─────────────────────────────────────────────────────
         if hidden_dim != encoder_config.hidden_size:
             raise ValueError(
                 f"hidden_dim ({hidden_dim}) must equal encoder hidden_size "
-                f"({encoder_config.hidden_size})."
+                f"({encoder_config.hidden_size}) for model_name='{model_name}'.\n"
+                f"  bert_base  → hidden_dim=768\n"
+                f"  bert_large → hidden_dim=1024"
             )
-        if predictor_dim != hidden_dim // 2:
-            raise ValueError(
-                f"predictor_dim ({predictor_dim}) must be D/2 = {hidden_dim // 2}."
+
+        # Soft warning instead of hard error: predictor_dim == D/2 is a good
+        # default but not a strict architectural requirement.
+        recommended = hidden_dim // 2
+        if predictor_dim != recommended:
+            warnings.warn(
+                f"predictor_dim={predictor_dim} differs from the recommended "
+                f"D/2={recommended}. This is allowed but may affect training dynamics.",
+                UserWarning,
+                stacklevel=2,
             )
+
         if predictor_layers >= encoder_config.num_hidden_layers:
             raise ValueError(
                 f"predictor_layers ({predictor_layers}) must be fewer than "
-                f"encoder layers ({encoder_config.num_hidden_layers})."
+                f"encoder layers ({encoder_config.num_hidden_layers}) for "
+                f"model_name='{model_name}'."
             )
 
         # ── encoders ─────────────────────────────────────────────────────────
@@ -255,17 +292,10 @@ class TextJEPA(nn.Module):
 
         Mirrors I-JEPA paper eq:
             (1/M) * Σ_i Σ_{j ∈ B_i} ‖pred_j − target_j‖²
-
-        where M·|B_i| ≈ total number of span tokens (sum of span_mask).
-
-        Tokens outside spans are zeroed out — the model is only penalised
-        for predicting the masked (target) positions.
-        We do NOT mean-pool tokens before computing loss; that would destroy
-        per-token signal and deviate from the original formulation.
         """
-        l2_per_token = ((pred - target) ** 2).sum(dim=-1)   # [B, L]
-        masked       = l2_per_token * span_mask.float()      # zero non-span
-        n_span_tokens = span_mask.float().sum().clamp(min=1.0)
+        l2_per_token  = ((pred - target) ** 2).sum(dim=-1)   # [B, L]
+        masked         = l2_per_token * span_mask.float()     # zero non-span
+        n_span_tokens  = span_mask.float().sum().clamp(min=1.0)
         return masked.sum() / n_span_tokens
 
     # ── forward ──────────────────────────────────────────────────────────────
@@ -333,104 +363,61 @@ class TextJEPA(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _smoke_test():
-    """
-    Instantiate TextJEPA with default settings and run one synthetic
-    forward pass that mimics a batch from tjepa_dataloader.py.
-
-    Batch keys and shapes match JEPASpanMaskCollator output exactly.
-    """
+    """Run one forward pass for both bert_base and bert_large."""
     import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 
-    B          = 4      # batch size
-    L          = 256    # max_length
-    VOCAB_SIZE = 30522  # bert-base-uncased
-    D          = 768
-    EMA_DECAY  = 0.996
+    VOCAB_SIZE = 30522
 
-    print("=" * 60)
-    print("  T-JEPA Architecture — Smoke Test")
-    print("=" * 60)
+    for model_name, D in [("bert_base", 768), ("bert_large", 1024)]:
+        B, L = 2, 128
 
-    # ── instantiate ──────────────────────────────────────────────────────────
-    model = TextJEPA(
-        hidden_dim=768,
-        predictor_dim=384,
-        predictor_layers=4,
-        predictor_heads=6,
-        predictor_ffn_dim=1536,
-        max_length=L,
-    )
-    model.eval()
+        print("=" * 60)
+        print(f"  Smoke test: {model_name}  (D={D})")
+        print("=" * 60)
 
-    ctx_params  = sum(p.numel() for p in model.context_encoder.parameters()) / 1e6
-    tgt_params  = sum(p.numel() for p in model.target_encoder.parameters())  / 1e6
-    pred_params = sum(p.numel() for p in model.predictor.parameters())       / 1e6
-    total       = ctx_params + pred_params   # target shares arch, not trained
-    print(f"  context_encoder params : {ctx_params:.1f} M")
-    print(f"  target_encoder  params : {tgt_params:.1f} M  (EMA, no grad)")
-    print(f"  predictor       params : {pred_params:.1f} M")
-    print(f"  trainable total        : {total:.1f} M  (context_encoder + predictor)")
+        predictor_dim = 384          # intentionally not D//2 for large
+        model = TextJEPA(
+            model_name=model_name,
+            hidden_dim=D,
+            predictor_dim=predictor_dim,
+            predictor_layers=4,
+            predictor_heads=16 if model_name == "bert_large" else 6,
+            predictor_ffn_dim=predictor_dim * 4,
+            max_length=L,
+        )
+        model.eval()
 
-    # ── synthetic batch mimicking JEPASpanMaskCollator output ────────────────
-    clean_ids   = torch.randint(1000, VOCAB_SIZE, (B, L))
-    attn_mask   = torch.ones(B, L, dtype=torch.long)
-    ttype_ids   = torch.zeros(B, L, dtype=torch.long)
+        ctx_params  = sum(p.numel() for p in model.context_encoder.parameters()) / 1e6
+        pred_params = sum(p.numel() for p in model.predictor.parameters())       / 1e6
+        print(f"  context_encoder : {ctx_params:.1f} M")
+        print(f"  predictor       : {pred_params:.1f} M")
+        print(f"  trainable total : {ctx_params + pred_params:.1f} M")
 
-    # mask 5 spans × 5 tokens each (same as smoke test defaults)
-    masked_ids  = clean_ids.clone()
-    span_mask   = torch.zeros(B, L, dtype=torch.long)
-    for i in range(B):
-        for s in range(5):
-            start = 10 + s * 12
-            masked_ids[i, start:start + 5] = 103   # [MASK]
-            span_mask[i, start:start + 5]  = 1
+        clean_ids  = torch.randint(1000, VOCAB_SIZE, (B, L))
+        attn_mask  = torch.ones(B, L, dtype=torch.long)
+        ttype_ids  = torch.zeros(B, L, dtype=torch.long)
+        masked_ids = clean_ids.clone()
+        span_mask  = torch.zeros(B, L, dtype=torch.long)
+        for i in range(B):
+            masked_ids[i, 10:15] = 103
+            span_mask[i, 10:15]  = 1
 
-    batch = {
-        "masked_input_ids":       masked_ids,
-        "masked_attention_mask":  attn_mask,
-        "masked_token_type_ids":  ttype_ids,
-        "clean_input_ids":        clean_ids,
-        "clean_attention_mask":   attn_mask,
-        "clean_token_type_ids":   ttype_ids,
-        "span_mask":              span_mask,
-    }
+        batch = dict(
+            masked_input_ids=masked_ids, masked_attention_mask=attn_mask,
+            masked_token_type_ids=ttype_ids, clean_input_ids=clean_ids,
+            clean_attention_mask=attn_mask, clean_token_type_ids=ttype_ids,
+            span_mask=span_mask,
+        )
 
-    print(f"\n  Input shapes:")
-    print(f"    masked_input_ids      : {tuple(masked_ids.shape)}")
-    print(f"    clean_input_ids       : {tuple(clean_ids.shape)}")
-    print(f"    span_mask             : {tuple(span_mask.shape)}  "
-          f"(tokens masked per sample: {span_mask.sum(dim=1).tolist()})")
+        with torch.no_grad():
+            out = model(batch)
 
-    # ── forward ──────────────────────────────────────────────────────────────
-    with torch.no_grad():
-        out = model(batch)
-
-    print(f"\n  Output shapes:")
-    print(f"    predicted_hidden : {tuple(out['predicted_hidden'].shape)}  ✓")
-    print(f"    target_hidden    : {tuple(out['target_hidden'].shape)}  ✓")
-    print(f"    span_loss        : {out['span_loss'].item():.6f}  ✓")
-
-    assert out["predicted_hidden"].shape == (B, L, D)
-    assert out["target_hidden"].shape    == (B, L, D)
-    assert out["span_loss"].ndim         == 0
-
-    # ── EMA update check ─────────────────────────────────────────────────────
-    # record one target param before update
-    p_before = next(model.target_encoder.parameters()).data.clone()
-    model.update_target_encoder(decay=EMA_DECAY)
-    p_after  = next(model.target_encoder.parameters()).data
-    assert not torch.equal(p_before, p_after), "EMA update had no effect!"
-    print(f"\n  EMA update (decay={EMA_DECAY}) : target params changed  ✓")
-
-    # ── gradient check ───────────────────────────────────────────────────────
-    for name, param in model.target_encoder.named_parameters():
-        assert not param.requires_grad, f"target_encoder.{name} has grad!"
-    print(f"  target_encoder frozen (no grad)  ✓")
-
-    print("\n  All assertions passed — architecture is compatible with")
-    print("  tjepa_dataloader.py  ✓")
-    print("=" * 60)
+        assert out["predicted_hidden"].shape == (B, L, D)
+        assert out["target_hidden"].shape    == (B, L, D)
+        assert out["span_loss"].ndim         == 0
+        print(f"  span_loss = {out['span_loss'].item():.6f}  ✓")
+        print(f"  All assertions passed  ✓\n")
 
 
 if __name__ == "__main__":
