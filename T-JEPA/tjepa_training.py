@@ -1,4 +1,4 @@
-# tjepa_training.py  (fair-comparison edition + Argument II metrics + MoCo Queue)
+# tjepa_training.py  (fair-comparison edition + Argument I-II metrics + MoCo Queue)
 # ─────────────────────────────────────────────────────────────────────────────
 # Trains T-JEPA for N epochs on local C4-subset (BERT-Large settings).
 # Logs JEPA loss + FAIR effective rank metrics every log_every iters.
@@ -10,6 +10,13 @@
 #   • JSON schema extended with all 3 metrics for cross-model plotting
 #   • Dual-axis plot shows normalized_rank (0–1) → directly comparable with I-JEPA
 #   • Output files: ../Arg-I/T-JEPA.json  and  ../Arg-I/T-JEPA.png
+#
+# ARGUMENT I METRICS (added):
+#   • residual_var — Var(ẑ_T − z_T) computed over SPAN positions only
+#                   (mirrors I-JEPA's Proposition 4.12 irreducible variance proxy)
+#                   For text: lexical ambiguity creates a floor → residual_var plateaus.
+#                   For images: predictor improves → residual_var decreases.
+#   Cadence: every arg1_every steps (default: same as log_every).
 #
 # ARGUMENT II METRICS (added):
 #   • lambda_min       — smallest eigenvalue of Σ_z (→0 signals collapse direction)
@@ -100,7 +107,10 @@ CFG = dict(
     ema_range       = (0.996, 0.999),
     # training
     log_every       = 10,
-    # Argument II metrics — set to same as log_every or higher to save compute
+    # ── ARGUMENT I metrics ────────────────────────────────────────────────
+    # residual_var computed over span positions every arg1_every steps
+    arg1_every       = 10,
+    # ── ARGUMENT II metrics ───────────────────────────────────────────────
     # cosine sim over a subsample of arg2_sample_size vectors (cap to avoid OOM)
     arg2_every       = 10,
     arg2_sample_size = 2048,
@@ -228,6 +238,57 @@ def get_lr_wd_ema_schedulers(total_steps, steps_per_epoch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Argument I metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def compute_residual_variance(
+    z_pred: torch.Tensor,
+    z_tgt:  torch.Tensor,
+) -> float:
+    """
+    Residual variance = Var(ẑ_T − z_T) computed over span positions.
+
+    This is the empirical proxy for the irreducible variance term in
+    Proposition 4.12 / the bias-variance decomposition (Section 4.4).
+
+    For images (I-JEPA): predictor improves over time → residual_var decreases.
+    For text  (T-JEPA):  lexical ambiguity creates a floor → residual_var plateaus.
+    The plateau level is a direct, falsifiable signature of the entropy ceiling
+    described in Argument I — it cannot be driven to zero by optimisation alone
+    because the span target distribution is genuinely ambiguous.
+
+    Formula:
+        residual     = ẑ_T − z_T                            [N_span, D]
+        residual_var = E[‖residual − E[residual]‖²]
+                     = mean over N of (sum over D of centered² entries)
+
+    Args:
+        z_pred: [N_span, D] predictor output ẑ_T  (detached, span tokens only)
+        z_tgt:  [N_span, D] target encoder output z_T (detached, span tokens only)
+
+    Returns:
+        float: scalar total variance of the residual (float32).
+               Returns nan if N_span == 0 (no span tokens in batch).
+
+    Notes:
+        • Both inputs cast to float32 before arithmetic to avoid bfloat16
+          precision issues that inflate near-zero residuals.
+        • Using SPAN positions only (not all tokens) mirrors I-JEPA's practice
+          of measuring residual on the predicted (masked) region — the region
+          the predictor is actually trained to reconstruct.
+    """
+    if z_pred.shape[0] == 0:
+        return float("nan")
+
+    residual  = (z_pred.float() - z_tgt.float())          # [N_span, D]
+    mean_res  = residual.mean(dim=0, keepdim=True)         # [1, D]
+    centered  = residual - mean_res                        # [N_span, D]
+    var       = (centered ** 2).mean().item()
+    return round(var, 8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Argument II metrics
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -262,9 +323,9 @@ def compute_arg2_metrics(z_flat: torch.Tensor, embed_dim: int) -> dict:
     z_centered = z - mean_z                         # [N, D]
     cov        = (z_centered.T @ z_centered) / max(z.shape[0] - 1, 1)  # [D, D]
     try:
-        eigvals       = torch.linalg.eigvalsh(cov)  # ascending, real
-        lambda_min    = eigvals[0].item()
-        lambda_max    = eigvals[-1].item()
+        eigvals          = torch.linalg.eigvalsh(cov)   # ascending, real
+        lambda_min       = eigvals[0].item()
+        lambda_max       = eigvals[-1].item()
         lambda_min_ratio = (lambda_min / lambda_max) if abs(lambda_max) > 1e-12 else 0.0
     except Exception:
         lambda_min       = float("nan")
@@ -318,47 +379,75 @@ def _write_plot_atomic(records: list[dict]) -> None:
     losses = [r["loss"]            for r in records]
     nranks = [r["normalized_rank"] for r in records]
 
-    # Arg II traces (only steps where metrics were computed)
+    # ── Arg I traces ──────────────────────────────────────────────────────
+    arg1_steps  = [r["global_step"]   for r in records if "residual_var" in r]
+    resvar_vals = [r["residual_var"]  for r in records if "residual_var" in r]
+
+    # ── Arg II traces ─────────────────────────────────────────────────────
     arg2_steps  = [r["global_step"]      for r in records if "cosine_sim_mean" in r]
     cos_means   = [r["cosine_sim_mean"]  for r in records if "cosine_sim_mean" in r]
     lam_ratios  = [r["lambda_min_ratio"] for r in records if "lambda_min_ratio" in r]
 
-    # Queue fill trace
-    q_steps = [r["global_step"]    for r in records if "moco_queue_len" in r]
-    q_lens  = [r["moco_queue_len"] for r in records if "moco_queue_len" in r]
+    # ── Queue fill trace ──────────────────────────────────────────────────
+    q_steps = [r["global_step"]     for r in records if "moco_queue_len" in r]
+    q_lens  = [r["moco_queue_len"]  for r in records if "moco_queue_len" in r]
 
-    fig, axes = plt.subplots(1, 3, figsize=(22, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(28, 5))
 
-    # ── Left panel: Loss + Normalized Rank ────────────────────────────────
-    ax1 = axes[0]
+    # ── Panel 0: Loss + Normalized Rank ───────────────────────────────────
+    ax0 = axes[0]
     color_loss = "#D85A30"
     color_rank = "#8B2500"
 
-    ax1.set_xlabel("Training steps", fontsize=12)
-    ax1.set_ylabel("MSE Loss (log scale)", color=color_loss, fontsize=12)
-    ax1.plot(steps, losses, color=color_loss, linewidth=1.8, label="T-JEPA loss")
-    ax1.set_yscale("log")
-    ax1.tick_params(axis="y", labelcolor=color_loss)
+    ax0.set_xlabel("Training steps", fontsize=11)
+    ax0.set_ylabel("MSE Loss (log scale)", color=color_loss, fontsize=11)
+    ax0.plot(steps, losses, color=color_loss, linewidth=1.8, label="T-JEPA loss")
+    ax0.set_yscale("log")
+    ax0.tick_params(axis="y", labelcolor=color_loss)
 
-    ax1r = ax1.twinx()
-    ax1r.set_ylabel("Normalized Effective Rank (rank / embed_dim)", color=color_rank, fontsize=11)
-    ax1r.plot(steps, nranks, color=color_rank, linewidth=1.8, linestyle="--",
+    ax0r = ax0.twinx()
+    ax0r.set_ylabel("Normalized Effective Rank (rank / embed_dim)",
+                    color=color_rank, fontsize=10)
+    ax0r.plot(steps, nranks, color=color_rank, linewidth=1.8, linestyle="--",
               label="T-JEPA norm. eff. rank")
-    ax1r.tick_params(axis="y", labelcolor=color_rank)
-    ax1r.set_ylim(0, 1)
+    ax0r.tick_params(axis="y", labelcolor=color_rank)
+    ax0r.set_ylim(0, 1)
 
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax1r.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=9)
-    ax1.set_title("Loss & Effective Rank", fontsize=12)
+    lines0, lbls0   = ax0.get_legend_handles_labels()
+    lines0r, lbls0r = ax0r.get_legend_handles_labels()
+    ax0.legend(lines0 + lines0r, lbls0 + lbls0r, loc="upper right", fontsize=8)
+    ax0.set_title("Loss & Effective Rank", fontsize=11)
 
-    # ── Middle panel: Arg II — Cosine Sim Mean + λ_min ratio ──────────────
-    ax2 = axes[1]
+    # ── Panel 1: Arg I — Residual Variance ────────────────────────────────
+    # Mirrors I-JEPA Panel 1 for direct visual comparison.
+    # A plateau in residual_var is the falsifiable text-JEPA signature:
+    # it cannot decrease to zero because span targets are lexically ambiguous.
+    ax1 = axes[1]
+    c_rv = "#FF7F0E"
+
+    ax1.set_xlabel("Training steps", fontsize=11)
+    ax1.set_ylabel("Residual Var  Var(ẑ_T − z_T)  [span tokens]",
+                   color=c_rv, fontsize=10)
+    if arg1_steps:
+        ax1.plot(arg1_steps, resvar_vals, color=c_rv, linewidth=1.8,
+                 label="residual_var (span)")
+        # Annotate the floor level at the last recorded value
+        last_rv = resvar_vals[-1]
+        ax1.axhline(y=last_rv, color=c_rv, linewidth=0.8, linestyle=":",
+                    alpha=0.55, label=f"last = {last_rv:.4f}")
+    ax1.tick_params(axis="y", labelcolor=c_rv)
+    ax1.set_ylim(bottom=0)
+
+    ax1.legend(loc="upper right", fontsize=8)
+    ax1.set_title("Arg I — Residual Variance (text floor)", fontsize=11)
+
+    # ── Panel 2: Arg II — Cosine Sim Mean + λ_min ratio ───────────────────
+    ax2 = axes[2]
     color_cos = "#2CA02C"
     color_lam = "#9467BD"
 
-    ax2.set_xlabel("Training steps", fontsize=12)
-    ax2.set_ylabel("Mean Pairwise Cosine Similarity", color=color_cos, fontsize=11)
+    ax2.set_xlabel("Training steps", fontsize=11)
+    ax2.set_ylabel("Mean Pairwise Cosine Similarity", color=color_cos, fontsize=10)
     if arg2_steps:
         ax2.plot(arg2_steps, cos_means, color=color_cos, linewidth=1.8,
                  label="cosine_sim_mean")
@@ -367,31 +456,31 @@ def _write_plot_atomic(records: list[dict]) -> None:
     ax2.axhline(y=1.0, color=color_cos, linewidth=0.8, linestyle=":", alpha=0.5)
 
     ax2r = ax2.twinx()
-    ax2r.set_ylabel("λ_min / λ_max  (collapse ratio)", color=color_lam, fontsize=11)
+    ax2r.set_ylabel("λ_min / λ_max  (collapse ratio)", color=color_lam, fontsize=10)
     if arg2_steps:
         ax2r.plot(arg2_steps, lam_ratios, color=color_lam, linewidth=1.8,
                   linestyle="--", label="λ_min ratio")
     ax2r.tick_params(axis="y", labelcolor=color_lam)
     ax2r.set_ylim(0, None)
 
-    lines3, labels3 = ax2.get_legend_handles_labels()
-    lines4, labels4 = ax2r.get_legend_handles_labels()
-    ax2.legend(lines3 + lines4, labels3 + labels4, loc="upper right", fontsize=9)
-    ax2.set_title("Argument II — Collapse Indicators", fontsize=12)
+    lines2, lbls2   = ax2.get_legend_handles_labels()
+    lines2r, lbls2r = ax2r.get_legend_handles_labels()
+    ax2.legend(lines2 + lines2r, lbls2 + lbls2r, loc="upper right", fontsize=8)
+    ax2.set_title("Argument II — Collapse Indicators", fontsize=11)
 
-    # ── Right panel: MoCo Queue fill progress ─────────────────────────────
-    ax3 = axes[2]
+    # ── Panel 3: MoCo Queue fill progress ─────────────────────────────────
+    ax3 = axes[3]
     c_q = "#E377C2"
-    ax3.set_xlabel("Training steps", fontsize=12)
-    ax3.set_ylabel("MoCo Queue Length", color=c_q, fontsize=11)
+    ax3.set_xlabel("Training steps", fontsize=11)
+    ax3.set_ylabel("MoCo Queue Length", color=c_q, fontsize=10)
     if q_steps:
         ax3.plot(q_steps, q_lens, color=c_q, linewidth=1.8, label="queue len")
     ax3.axhline(y=CFG["moco_queue_size"], color=c_q, linewidth=0.8,
                 linestyle=":", alpha=0.5, label=f"max={CFG['moco_queue_size']}")
     ax3.tick_params(axis="y", labelcolor=c_q)
     ax3.set_ylim(0, CFG["moco_queue_size"] * 1.05)
-    ax3.legend(loc="lower right", fontsize=9)
-    ax3.set_title("MoCo Queue Fill", fontsize=12)
+    ax3.legend(loc="lower right", fontsize=8)
+    ax3.set_title("MoCo Queue Fill", fontsize=11)
 
     current_step = steps[-1] if steps else 0
     fig.suptitle(
@@ -401,7 +490,7 @@ def _write_plot_atomic(records: list[dict]) -> None:
     fig.tight_layout()
 
     tmp = PNG_PATH.with_suffix(".tmp.png")
-    fig.savefig(str(tmp), dpi=100)
+    fig.savefig(str(tmp), dpi=150)
     plt.close(fig)
     tmp.replace(PNG_PATH)
 
@@ -547,21 +636,17 @@ def train():
 
             # ── Update MoCo queue (AFTER optimiser + EMA update) ──────────
             # Enqueue the pooled target span representations from this batch.
-            # out["z_target"] is expected to be [B, num_spans, D] or [B*S, L, D].
-            # We pool to [B, D] before enqueueing.
             with torch.no_grad():
                 if "z_target" in out:
                     z_tgt_raw = out["z_target"].detach()
-                    # Handle variable shapes: flatten all but last dim → [N, D]
                     if z_tgt_raw.dim() == 3:
-                        # [B, S, D] or [B*S, L, D] — mean-pool middle dim
-                        z_enq = z_tgt_raw.mean(dim=1)   # [B or B*S, D]
+                        z_enq = z_tgt_raw.mean(dim=1)
                     else:
-                        z_enq = z_tgt_raw               # already [N, D]
+                        z_enq = z_tgt_raw
                 else:
                     # Fallback: encode full sequence with target encoder, pool → [B, D]
-                    z_full = model.encode_full_sequence(batch, use_target=True)  # [B, L, D]
-                    z_enq  = z_full.detach().mean(dim=1)                         # [B, D]
+                    z_full = model.encode_full_sequence(batch, use_target=True)
+                    z_enq  = z_full.detach().mean(dim=1)
             moco_queue.enqueue(z_enq)
 
             epoch_losses.append(loss.item())
@@ -592,6 +677,19 @@ def train():
                     moco_queue_len      = len(moco_queue),
                 )
 
+                # ── Argument I: Residual Variance ──────────────────────────
+                # Computed over SPAN positions only — the region the predictor
+                # is trained to reconstruct (mirrors I-JEPA's masked-patch logic).
+                # A plateau here is the key Argument I signature for text:
+                # lexical ambiguity creates an irreducible floor that I-JEPA lacks.
+                if global_step % CFG["arg1_every"] == 0:
+                    with torch.no_grad():
+                        span_mask_bool = batch["span_mask"].bool()           # [B, L]
+                        z_pred_span = out["predicted_hidden"].detach()[span_mask_bool]  # [N_span, D]
+                        z_tgt_span  = out["target_hidden"].detach()[span_mask_bool]     # [N_span, D]
+                        res_var = compute_residual_variance(z_pred_span, z_tgt_span)
+                    record["residual_var"] = res_var
+
                 # ── Argument II metrics ────────────────────────────────────
                 if global_step % CFG["arg2_every"] == 0:
                     arg2 = compute_arg2_metrics(z_flat, embed_dim=CFG["hidden_dim"])
@@ -601,6 +699,7 @@ def train():
                         f"loss={loss.item():.4f}  "
                         f"eff_rank={rank_info['effective_rank']:.2f}  "
                         f"norm_rank={rank_info['normalized_rank']:.4f}  "
+                        f"res_var={record.get('residual_var', float('nan')):.6f}  "
                         f"λ_min_ratio={arg2['lambda_min_ratio']:.4f}  "
                         f"cos_sim_mean={arg2['cosine_sim_mean']:.4f}  "
                         f"cos_sim_p95={arg2['cosine_sim_p95']:.4f}  "
@@ -613,6 +712,7 @@ def train():
                         f"loss={loss.item():.4f}  "
                         f"eff_rank={rank_info['effective_rank']:.2f}  "
                         f"norm_rank={rank_info['normalized_rank']:.4f}  "
+                        f"res_var={record.get('residual_var', float('nan')):.6f}  "
                         f"q={len(moco_queue)}  "
                         f"lr={current_lr:.6f}"
                     )
