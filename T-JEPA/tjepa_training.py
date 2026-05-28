@@ -111,10 +111,10 @@ CFG = dict(
     final_weight_decay = 0.4,
     ema_range       = (0.996, 0.999),
     # training
-    log_every       = 10,
+    log_every       = 100,
     # ── HELD-OUT EVAL ─────────────────────────────────────────────────────
     # Every eval_every steps: full val-split pass, all metrics, separate JSON
-    eval_every      = 100,
+    eval_every      = 1000,
     eval_max_batches = None,   # None = full val set; set int to cap (faster debug)
     # ── ARGUMENT I metrics ────────────────────────────────────────────────
     arg1_every       = 10,
