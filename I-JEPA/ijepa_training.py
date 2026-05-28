@@ -538,8 +538,19 @@ def run_held_out_eval(
     z_pred_pool_list = []
 
     max_batches = CFG["eval_max_batches"]
+    total_val_batches = len(val_loader) if max_batches is None else min(len(val_loader), max_batches)
+    
+    val_bar = tqdm(
+        enumerate(val_loader), 
+        total=total_val_batches, 
+        desc=f"Val [Step {global_step}]", 
+        unit="it", 
+        leave=False, 
+        dynamic_ncols=True,
+        position=2
+    )
 
-    for batch_idx, (imgs, masks_enc, masks_pred) in enumerate(val_loader):
+    for batch_idx, (imgs, masks_enc, masks_pred) in val_bar:
         if max_batches is not None and batch_idx >= max_batches:
             break
 
