@@ -75,7 +75,7 @@ from ijepa_dataloader import make_imagenet1k_dataloader
 CFG = dict(
     # data
     data_dir        = SCRIPT_DIR / "data",
-    batch_size      = 128,
+    batch_size      = 64,
     num_workers     = 10,
     crop_size       = 224,
     pin_mem         = True,
