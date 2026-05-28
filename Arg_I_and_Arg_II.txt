@@ -7,400 +7,236 @@ Paper: "Why JEPA Works on Images but Fails on Text"
 PHẦN 0 — BỨC TRANH TỔNG THỂ
 --------------------------------------------------------------------------------
 
-Hai argument đầu tiên của paper không phải là hai hiện tượng độc lập. Chúng
-hình thành một failure cascade có thứ tự nhân quả:
+Hai argument đầu tiên hình thành một failure cascade có thứ tự nhân quả:
 
     Argument I (entropy ceiling)
-        → tạo ra weak gradient signal
+        → weak gradient signal
         → optimizer mất định hướng
         → Argument II (collapse) được triggered
 
-Vì vậy, thiết kế thực nghiệm không phải là "hai experiment riêng biệt" mà là
-"một training run duy nhất được quan sát qua hai lăng kính khác nhau, ở hai
-giai đoạn thời gian khác nhau."
-
-Điều này có hai hệ quả quan trọng:
-  1. Tiết kiệm compute: log thêm metrics không tốn thêm training
-  2. Quan sát được transition point: thời điểm Phase 1 chuyển sang Phase 2,
-     cái mà chạy riêng lẻ sẽ không bao giờ thấy được
+Vì vậy đây là một training run duy nhất được quan sát qua hai lăng kính ở hai
+giai đoạn thời gian khác nhau — không phải hai experiment riêng biệt.
 
 --------------------------------------------------------------------------------
 PHẦN 1 — ARGUMENT I: ENTROPY CEILING
 --------------------------------------------------------------------------------
 
 1.1 INTUITION
---------------
-
-Hãy tưởng tượng bạn đang cố đoán một từ bị che trong câu:
-
-    "The cat sat on the ___."
-
-Dù bạn đọc cả câu kỹ đến đâu, vẫn có nhiều từ hợp lệ: mat, floor, chair,
-table, roof, bed, ground... Sự mơ hồ này là bản chất của ngôn ngữ — không
-phải do bạn đọc không kỹ, mà do cấu trúc thống kê của ngôn ngữ tự nhiên.
-
-Ngược lại, nếu bạn nhìn vào một bức ảnh bị che một phần:
-
-    [bầu trời xanh] [mây trắng] [???]
-
-Phần bị che gần như chắc chắn cũng là bầu trời hoặc mây. Spatial continuity
-của image tạo ra một prior cực kỳ mạnh — patch kế bên gần như predictable
-hoàn toàn từ patches xung quanh.
+-------------
 
 JEPA học bằng cách predict latent representation của vùng bị mask. Với image,
-đây là task có nghĩa vì target predictable. Với text, đây là task không thể
-giải hoàn toàn được vì target có irreducible ambiguity.
-
-Hệ quả trực tiếp: MSE loss của T-JEPA không thể xuống dưới một ngưỡng nhất
-định, ngay cả khi encoder đã học tốt nhất có thể. Đây là entropy ceiling.
-
-Về mặt information theory (Proposition 4.5 trong paper):
-  H(x^(j) | x_C) ≈ 3–5 bits per token
-
-Nghĩa là ngay cả với full bidirectional context, vẫn còn 3–5 bits uncertainty
-về token tiếp theo. Bằng Lemma 4.1 (Data Processing Inequality), ceiling này
+spatial continuity tạo ra prior mạnh — patch kế bên gần như predictable hoàn
+toàn từ context. Với text, lexical ambiguity là bất khả quy: ngay cả với full
+bidirectional context, vẫn còn 3–5 bits uncertainty về token tiếp theo
+(Proposition 4.5). Bằng Data Processing Inequality (Lemma 4.1), ceiling này
 propagate lên latent space:
-  H(z_T^(j) | z_C, p_j) ≥ H(x^(j) | x_C) - ε ≈ 3–5 bits
 
-Gradient signal mà JEPA nhận được từ loss này là NOISY — dominated bởi
-irreducible variance thay vì structured learning signal.
+    H(z_T | z_C, p_j) >= H(x^(j) | x_C) - eps  ≈  3–5 bits
 
-
-1.2 ĐIỀU KIỆN CẦN XÁC NHẬN ĐỂ CLAIM ARGUMENT I
--------------------------------------------------
-
-Argument I được confirm khi và chỉ khi đồng thời observe được:
-
-  ĐIỀU KIỆN 1: loss_text >> loss_image tại mọi checkpoint
-  → Định lượng: plateau của T-JEPA cao hơn plateau của I-JEPA một cách
-    có ý nghĩa thống kê, không chỉ là noise
-
-  ĐIỀU KIỆN 2: effective_rank_text vẫn cao tại thời điểm loss plateau
-  → Định lượng: effective rank của text encoder > một ngưỡng có ý nghĩa
-    (gợi ý: > 30% của rank tối đa) trong khi loss đã plateau
-  → Đây là điều kiện LOẠI TRỪ: rank cao xác nhận encoder vẫn đang học,
-    chưa collapse, tức loss cao là do entropy ceiling chứ không phải shortcut
-
-  NẾU ĐIỀU KIỆN 2 KHÔNG THỎA: không được claim Argument I.
-  Phải report rằng collapse (Argument II) đã xảy ra và che mất signal của
-  Argument I.
+Hệ quả: gradient của T-JEPA bị dominated bởi irreducible noise, không có
+structured learning signal.
 
 
-1.3 THIẾT KẾ ĐO LƯỜNG
------------------------
+1.2 ĐIỀU KIỆN XÁC NHẬN ARGUMENT I
+-----------------------------------
 
-METRIC CHÍNH — Training loss theo steps:
-  - Log MSE loss của I-JEPA và T-JEPA tại mọi bước (hoặc mỗi N bước)
-  - Cùng architecture, cùng hyperparameters, chỉ khác modality
-  - Dataset: ImageNet cho image, C4 cho text (cả hai khoảng 100K mẫu split 90/10 cho train và val)
-  - Normalize loss nếu cần để comparable (hoặc report riêng với chú thích rõ)
+Argument I được confirm khi đồng thời observe được ba điều kiện sau:
 
-METRIC KIỂM SOÁT — Effective rank của Σ_z:
-  Công thức: effective_rank = exp(H(λ_i / Σλ_i))
-  trong đó λ_i là eigenvalues của representation covariance matrix Σ_z
+  [CHÍNH] Điều kiện 1 — I(z_C; z_T) của text thấp hơn image và không tăng:
+    Đây là đại lượng Lemma 4.1 đặt ceiling trực tiếp lên. Với image, spatial
+    smoothness đảm bảo I(x_C; x_T) cao, kéo theo I(z_C; z_T) cao. Với text,
+    lexical ambiguity đặt hard ceiling lên I(x_C; x_T) bất kể encoder mạnh
+    đến đâu — ceiling này propagate xuống latent space.
+    → Đo bằng InfoNCE lower bound trên frozen representations.
+    → Nếu I(z_C; z_T) text plateau thấp trong khi image tăng: direct evidence.
 
-  Cách tính:
-    1. Lấy một batch representations z_C từ encoder
-    2. Tính Σ_z = E[zz^T] - E[z]E[z]^T
-    3. Tính eigenvalue decomposition của Σ_z
-    4. Normalize eigenvalues thành probability distribution
-    5. Tính entropy của distribution đó
-    6. Effective rank = exp(entropy)
+  [CHÍNH] Điều kiện 2 — Prediction residual variance không giảm sau convergence:
+    Tính Var(z_hat_T - z_T) theo thời gian. Với image, variance này giảm đều
+    vì predictor cải thiện. Với text, variance plateau tại một giá trị không
+    thể giảm thêm — đây là irreducible variance từ Proposition 4.12, là
+    empirical evidence trực tiếp nhất của entropy ceiling.
+    Công thức: residual_var = E[||z_hat_T - z_T||^2] - ||E[z_hat_T - z_T]||^2
 
-  Ý nghĩa:
-    - Effective rank = d (full dimension): mọi chiều đều được dùng đều nhau
-    - Effective rank = 1: tất cả variance tập trung trên một chiều → full collapse
-    - Effective rank > 0.3d: encoder vẫn đang học meaningfully (gợi ý ngưỡng)
+  [LOẠI TRỪ] Điều kiện 3 — effective_rank_text vẫn cao tại thời điểm plateau:
+    Rank cao xác nhận encoder chưa collapse, tức plateau là do entropy ceiling
+    chứ không phải degenerate solution.
+    Ngưỡng gợi ý: effective rank > 30% rank tối đa.
+    → NẾU rank thấp: không được claim Arg I. Phải report Arg II đã xảy ra
+      trước và che mất signal của Arg I.
 
-LOG FREQUENCY:
-  - Loss: mỗi bước hoặc mỗi 100 bước
-  - Effective rank: mỗi 500–1000 bước (tốn compute hơn vì cần full batch)
-  - Checkpoint lưu tại: early training, mid training, và khi loss bắt đầu plateau
+  GHI CHÚ VỀ MSE LOSS:
+    MSE loss KHÔNG phải metric hợp lý để validate Argument I. Loss là đại lượng
+    trong latent space, bị ảnh hưởng bởi scale của representations, predictor
+    capacity, và training dynamics — không chỉ bởi entropy của token distribution.
+    Ngoài ra, loss của hai modality không directly comparable vì MSE phụ thuộc
+    vào scale của z, mà scale này khác nhau giữa image và text encoder.
+    → Loss chỉ được report như secondary observation về training stability.
 
 
-1.4 EXPECTED RESULTS VÀ CÁCH ĐỌC
-----------------------------------
+1.3 METRICS CẦN LOG CHO ARGUMENT I
+-------------------------------------
 
-Timeline mong đợi với Argument I (KHÔNG có collapse):
+  Mỗi N steps (N = log_every, tính trên held-out batch, representations detached):
+
+    MI_proxy_text      — InfoNCE estimate của I(z_C; z_T) cho text encoder
+    MI_proxy_image     — InfoNCE estimate của I(z_C; z_T) cho image encoder
+    residual_var_text  — Var(z_hat_T - z_T) sau khi predictor converge, text
+    residual_var_image — Var(z_hat_T - z_T) sau khi predictor converge, image
+    effective_rank_text  — exp(H(lambda_i / sum(lambda_i))), text encoder
+    effective_rank_image — exp(H(lambda_i / sum(lambda_i))), image encoder
+
+  InfoNCE estimate:
+    I_lower(z_C; z_T) >= E[log( exp(z_C · z_T / tau) / sum_k exp(z_C · z_T^k / tau) )]
+    Tính trên batch, temperature tau = 0.1, dùng negative samples trong batch.
+
+
+1.4 EXPECTED RESULTS
+----------------------
 
   Bước 0–2k:
-    I-JEPA loss: giảm nhanh từ ~2.8 xuống ~0.5
-    T-JEPA loss: giảm từ ~2.5 nhưng chậm hơn, chững lại ở ~1.4–1.6
-    Image rank: tăng dần, ổn định ở mức cao (ví dụ 75–85/128)
-    Text rank: tăng dần tương tự, ổn định ở mức cao tương đương (70–80/128)
+    MI text: thấp và không tăng → entropy ceiling đã active từ đầu
+    MI image: tăng dần
+    residual_var text: plateau sớm ở mức cao
+    residual_var image: giảm đều
 
   Bước 2k–10k:
-    I-JEPA loss: tiếp tục giảm chậm về ~0.08–0.1 (gần zero)
-    T-JEPA loss: PLATEAU tại ~1.4–1.6, không giảm thêm
-    Image rank: duy trì ở mức cao, ổn định
-    Text rank: duy trì ở mức cao (đây là key observation)
+    MI text: vẫn plateau thấp
+    MI image: tiếp tục tăng
+    Rank text: vẫn cao (key observation: rank cao ≠ learning tốt ở đây)
+    Rank image: cao và ổn định
 
-  KEY OBSERVATION cho paper:
-    Tại bước ~3k–5k, hai đường rank gần bằng nhau và đều cao,
-    nhưng hai đường loss đã phân kỳ rõ rệt.
-    → "Text encoder đang học tích cực (rank cao) nhưng không thể
-       giảm loss (entropy ceiling) — đây là Argument I."
+  KEY OBSERVATION:
+    MI text plateau + rank text cao → text encoder không collapse nhưng không
+    thể extract thêm information từ context vì lexical ambiguity.
 
 
 1.5 VISUALIZATION CHO ARGUMENT I
 ----------------------------------
 
-FIGURE TYPE: Dual-axis line chart (hai trục y)
-  - Trục y trái: MSE loss (0 đến ~3.0)
-  - Trục y phải: Effective rank (0 đến d)
-  - Trục x: Training steps
+  Figure chính: dual-axis line chart
+    - Trục y trái: MI proxy (0 đến max)
+    - Trục y phải: effective rank (normalized 0–1)
+    - Trục x: training steps
+    - Bốn đường: MI image (solid xanh), MI text (solid cam),
+                 rank image (dashed xanh), rank text (dashed cam)
 
-BỐN ĐƯỜNG:
-  1. I-JEPA loss         — solid, màu xanh dương (#378ADD)
-  2. T-JEPA loss         — solid, màu cam đỏ (#D85A30)
-  3. Image effective rank — dashed, màu xanh dương
-  4. Text effective rank  — dashed, màu cam đỏ
+  Annotation:
+    a) Shaded region nằm ngang: vùng MI thấp tương ứng entropy floor 3–5 bits
+    b) Chú thích: "Text MI saturates at ceiling set by lexical ambiguity"
+    c) Vertical dashed line tại bước rank vẫn cao: loại trừ collapse
 
-ANNOTATION QUAN TRỌNG:
-  a) Shaded region: vùng tô màu cam nhạt giữa 1.45 và 2.65 trên trục loss
-     → Biểu diễn irreducible entropy floor (3–5 bits/token)
-     → T-JEPA loss nằm trong vùng này = visual proof of ceiling
-  
-  b) Vertical dashed line: tại bước mà rank của cả hai vẫn còn tương đương
-     → Caption: "At this point, both encoders maintain high rank —
-        confirming text loss plateau is due to entropy ceiling, not collapse"
-  
-  c) Text annotation tại plateau: "Entropy floor ≈ 3–5 bits/token"
+  Figure phụ: residual_var theo steps
+    - Một đường image (giảm), một đường text (plateau)
+    - Message: phần variance không thể giảm thêm = irreducible noise từ Prop 4.12
 
-LÝ DO CHỌN DUAL-AXIS THAY VÌ HAI FIGURE RIÊNG:
-  → Người đọc cần nhìn đồng thời loss và rank tại CÙNG một thời điểm
-  → Nếu tách ra, phải compare thủ công, dễ miss transition point
-  → Dual-axis là standard trong ML papers khi hai metrics có đơn vị khác nhau
-     nhưng cần đọc cùng nhau (loss và accuracy, loss và rank...)
-
-CAPTION GỢI Ý:
-  "Figure X: Training dynamics of I-JEPA and T-JEPA. Solid lines show MSE loss
-  (left axis); dashed lines show effective rank of the representation covariance
-  (right axis). The shaded region marks the irreducible entropy floor predicted
-  by Proposition 4.5. While both encoders maintain high effective rank (dashed
-  lines remain elevated), T-JEPA loss plateaus within the entropy floor whereas
-  I-JEPA loss continues to decrease — confirming Argument I: the text plateau
-  is caused by irreducible lexical ambiguity, not representation collapse."
 
 --------------------------------------------------------------------------------
 PHẦN 2 — ARGUMENT II: REPRESENTATION COLLAPSE
 --------------------------------------------------------------------------------
 
 2.1 INTUITION
---------------
+-------------
 
-Sau Phase 1, T-JEPA đang trong một trạng thái bất ổn:
-  - Loss plateau cao → optimizer vẫn nhận được loss signal
-  - Nhưng gradient dominated bởi irreducible noise → không có clear direction
-
-Hãy hình dung optimizer như một người đang cố leo đồi trong sương mù dày đặc.
-Họ biết mình chưa đến đỉnh (loss còn cao) nhưng không thấy đường nào dẫn lên
-(gradient noisy). Trong tình huống này, con người có thể đứng yên hoặc đi
-loanh quanh. Optimizer thì sẽ tìm bất kỳ hướng nào giảm được loss —
-kể cả hướng "gian lận."
-
-Hướng gian lận đó là: map tất cả inputs về cùng một điểm (hoặc subspace rất
-nhỏ) trong latent space. Nếu encoder output cùng một vector c cho mọi input,
-thì predictor chỉ cần học "luôn predict c" → loss giảm về gần 0.
-
-Đây là collapse — một degenerate solution mà JEPA không có cơ chế ngăn chặn
-trên text (không có spatial metric để tạo geometric repulsion như image).
-
-Kết quả:
-  - Loss T-JEPA tụt mạnh, thậm chí xuống thấp hơn cả I-JEPA
-  - Effective rank của text encoder giảm về gần 0
-  - Nhưng representation không encode được bất kỳ thông tin có nghĩa nào
-  - Downstream task performance: rất kém
-
-Đây là lý do loss thấp KHÔNG CÓ NGHĨA LÀ HỌC TỐT trong trường hợp này.
+Sau khi entropy ceiling (Arg I) làm gradient noisy, optimizer mất định hướng
+và tìm đến degenerate solution: map tất cả inputs về cùng subspace nhỏ trong
+latent space. Predictor chỉ cần học "luôn predict vector đó" → loss giảm nhưng
+representation vô nghĩa. I-JEPA tránh được điều này nhờ spatial diversity của
+image buộc contexts khác nhau phải encode khác nhau (Prop 4.8). Text không có
+cơ chế tương đương (Prop 4.9).
 
 
 2.2 TẠI SAO ARGUMENT I TRIGGER ARGUMENT II
 --------------------------------------------
 
-Đây là sequential mechanism quan trọng nhất của paper:
+  Step 1: Entropy ceiling → gradient = (z_hat_T - z_T) dominated bởi noise
+  Step 2: Weak gradient → optimizer không maintain spread của representations
+  Step 3: Degenerate local minimum xuất hiện: map semantically similar inputs
+          về cùng vector, predictor học mapping đó → loss giảm giả tạo
+  Step 4: Rank collapse → loss tiếp tục giảm mà representation không có nghĩa
 
-  STEP 1: Entropy ceiling (Arg I) tạo ra gradient yếu
-    → Gradient của JEPA loss là: ∂L/∂θ ∝ (ẑ_T - z_T)
-    → Với text, z_T là noisy (nhiều valid continuations)
-    → Gradient dominated bởi noise term, không có clear signal
-
-  STEP 2: Weak gradient tạo điều kiện cho collapse
-    → Optimizer không có strong signal để maintain spread của representations
-    → EMA và stop-gradient ngăn được constant collapse (z=0)
-    → Nhưng KHÔNG ngăn được semantic collapse (nhiều inputs → cùng vector)
-
-  STEP 3: Collapse xảy ra như một local minimum
-    → Encoder tìm được: "nếu tôi map mọi câu có cùng nghĩa về cùng vector,
-       loss sẽ giảm mà predictor vẫn predict được"
-    → Đây là Proposition 4.9 trong paper — degenerate solution tồn tại
-       và JEPA loss không penalize nó
-
-  STEP 4: Rank collapse kéo theo loss giảm giả tạo
-    → Loss thấp vì predictor đã "học" được mapping từ class → vector
-    → Nhưng mapping này vô nghĩa về mặt representation quality
-
-CÁI CẦN PHÂN BIỆT RÕ TRONG PAPER:
-  - "Collapse xảy ra SAU khi entropy ceiling" → temporal claim, dễ observe
-  - "Collapse xảy ra VÌ entropy ceiling"      → causal claim, cần ablation
-  
-  Trong body paper: claim temporal (conservative, defensible)
-  Trong discussion: suggest causal mechanism
-  Trong limitations: acknowledge cần ablation để prove causality
+  Body paper: claim temporal ("collapse xảy ra SAU plateau")
+  Discussion: suggest causal mechanism
+  Limitations: acknowledge cần ablation để prove causality
 
 
-2.3 ĐIỀU KIỆN CẦN XÁC NHẬN ĐỂ CLAIM ARGUMENT II
---------------------------------------------------
+2.3 ĐIỀU KIỆN XÁC NHẬN ARGUMENT II
+-------------------------------------
 
-Argument II được confirm khi observe được:
-
-  ĐIỀU KIỆN 1: rank_text giảm mạnh sau một threshold trong training
-  → Phân biệt với noise: giảm liên tục qua nhiều checkpoints, không phải
-    fluctuation ngắn hạn
-
-  ĐIỀU KIỆN 2: loss_text giảm THEO rank (correlation có hướng)
-  → Khi rank bắt đầu giảm, loss cũng bắt đầu giảm
-  → Nếu loss giảm mà rank vẫn cao: đó là learning thật, không phải collapse
-
-  ĐIỀU KIỆN 3 (confirmatory): downstream performance không cải thiện
-  → Đây là "smoking gun" — loss thấp nhưng task performance tệ
-  → Chứng minh representation không encode useful information
-
-  ĐIỀU KIỆN 4 (optional nhưng mạnh): pairwise cosine similarity → 1
-  → Lấy batch z_C, tính pairwise cosine similarity
-  → Distribution của similarity tập trung gần 1 = collapse
-  → Distribution spread đều = healthy representations
+  Điều kiện 1: rank_text giảm liên tục qua nhiều checkpoints (không phải noise)
+  Điều kiện 2: MSE loss text giảm CÙNG CHIỀU với rank (correlation có hướng)
+               → loss giảm trong khi rank vẫn cao = learning thật, không phải collapse
+  Điều kiện 3: downstream probe accuracy DROP dù loss thấp (smoking gun)
+  Điều kiện 4 (optional): pairwise cosine similarity → 1 (tập trung gần 1.0)
 
 
-2.4 BA METRICS PHỤ CHI TIẾT
------------------------------
+2.4 METRICS CHO ARGUMENT II
+------------------------------
 
-METRIC 1 — λ_min(Σ_z):
-  Eigenvalue nhỏ nhất của covariance matrix
-  Cách tính: cùng pipeline với effective rank, chỉ lấy min eigenvalue
-  Ý nghĩa: → 0 nghĩa là ít nhất một chiều trong latent space bị bỏ hoàn toàn
-  Threshold: λ_min < 1e-4 × λ_max → coi là collapse direction
+  METRIC CHÍNH:
+    effective_rank         — exp(H(lambda_i / sum(lambda_i))), đo theo steps
+    normalized_rank        — effective_rank / embed_dim, range 0–1
+    MSE loss               — dùng để đối chiếu với rank trajectory
 
-METRIC 2 — Pairwise cosine similarity distribution:
-  Cách tính:
-    1. Lấy batch N samples, tính z_C cho mỗi sample
-    2. Normalize: z_hat = z / ||z||
-    3. Tính ma trận similarity S = z_hat @ z_hat.T
-    4. Lấy upper triangle (exclude diagonal)
-    5. Plot histogram của các giá trị này
-  Ý nghĩa:
-    - Histogram tập trung gần 1.0: collapse
-    - Histogram spread đều từ -1 đến 1: healthy
-    - Image encoder expected: moderate spread
-    - Text encoder expected: shift về phía 1 sau collapse point
+  METRICS PHỤ:
+    lambda_min             — eigenvalue nhỏ nhất của cov matrix Σ_z
+    lambda_min_ratio       — lambda_min / lambda_max; → 0 = collapse direction
+    cosine_sim_mean        — mean pairwise cosine sim của representations
+    cosine_sim_std         — std pairwise cosine sim
+    cosine_sim_p95         — percentile 95; shift về 1.0 = collapse
+    cosine_sim_hist        — 10-bin histogram [-1, 1], lưu dưới dạng list[int]
+    downstream_probe_score — linear probe accuracy trên frozen representations
+                             (image: ImageNet top-1; text: SST-2 hoặc STS-B)
 
-METRIC 3 — Downstream task performance (probe):
-  Setup: linear probe frozen representations
-  Task gợi ý:
-    - Image: linear classification trên ImageNet (top-1 accuracy)
-    - Text: STS-B (Semantic Textual Similarity) hoặc linear classification
-      trên SST-2 (sentiment)
-  Frequency: evaluate mỗi 2k–5k steps
-  Expected:
-    - Image: accuracy tăng dần theo training
-    - Text: accuracy tăng nhẹ ở Phase 1, sau đó DROP khi collapse xảy ra
-    - Drop này là evidence mạnh nhất: loss giảm nhưng usefulness giảm
+  LOG FREQUENCY:
+    - effective_rank, lambda_min, lambda_min_ratio, cosine metrics: mỗi log_every steps
+    - downstream_probe_score: mỗi 5000 steps (tốn compute hơn)
 
 
-2.5 THIẾT KẾ ĐO LƯỜNG
------------------------
+2.5 EXPECTED RESULTS
+----------------------
 
-CÙNG TRAINING RUN VỚI ARGUMENT I, log thêm:
-
-  Mỗi 500 steps:
-    - λ_min(Σ_z) cho cả image và text encoder
-    - Effective rank (đã có từ Arg I)
-
-  Mỗi 1000 steps:
-    - Pairwise cosine similarity distribution (batch size 512 samples)
-    - Histogram values (có thể chỉ log mean và std để tiết kiệm storage)
-
-  Mỗi 2000–5000 steps:
-    - Linear probe accuracy trên downstream task
-
-  CHECKPOINT đặc biệt: save full model tại transition point
-    → Transition point = bước mà rank bắt đầu giảm
-    → Dùng để post-hoc analysis và visualization
-
-
-2.6 EXPECTED RESULTS VÀ CÁCH ĐỌC
-----------------------------------
-
-Timeline mong đợi với collapse scenario:
-
-  Bước 0–4k (Phase 1 — Arg I visible):
-    Loss text: plateau cao ~1.5, loss image: giảm đều
-    Rank text: cao ~70–75, rank image: cao ~75–80
+  Bước 0–4k (Phase 1):
+    Rank text cao ~70–75, loss plateau
     Cosine sim text: moderate spread
-    Downstream text: tăng nhẹ
+    Probe text: tăng nhẹ
 
   Bước ~4k (Transition point):
-    Loss text: bắt đầu giảm đột ngột
-    Rank text: bắt đầu giảm đột ngột
-    → Đây là "collapse begins" marker trong figure
+    Rank text bắt đầu giảm đột ngột
+    Loss text bắt đầu giảm cùng chiều
 
-  Bước 4k–10k (Phase 2 — Arg II visible):
-    Loss text: tụt về ~0.05–0.1, thấp hơn cả I-JEPA
-    Rank text: giảm về ~5–10 (gần degenerate)
-    Cosine sim text: tập trung gần 1.0
-    Downstream text: DROP so với peak ở transition point
-    λ_min text: → 0
+  Bước 4k–10k (Phase 2):
+    Rank text → ~5–10 (near degenerate)
+    Loss text thấp hơn cả I-JEPA
+    Cosine sim text → gần 1.0
+    lambda_min text → 0
+    Probe text: DROP so với peak tại transition point
 
-  Image trong suốt quá trình:
-    Loss: giảm đều, không có sudden drop
-    Rank: duy trì cao, không collapse
-    Downstream: tăng đều theo training
+  Image trong suốt:
+    Rank ổn định cao, loss giảm đều, probe tăng monotonically
 
 
-2.7 VISUALIZATION CHO ARGUMENT II
------------------------------------
+2.6 VISUALIZATION CHO ARGUMENT II
+------------------------------------
 
-FIGURE CHÍNH — Collapse scenario (dual-axis, tương tự Arg I nhưng khác data):
-
-  Cấu trúc: giống Figure Arg I
-  Điểm khác biệt:
-    - T-JEPA loss có sudden drop sau transition point
-    - Text rank giảm mạnh sau transition point
-    - Thêm vertical dashed line tại transition point với label "collapse begins"
+  Figure chính: dual-axis, tương tự Arg I nhưng dùng rank và MSE loss
+    - Thêm vertical dashed line tại transition point: "collapse begins"
     - Thêm shaded region sau transition point (collapse zone)
+    - Màu: xanh dương (#378ADD) = image, cam đỏ (#D85A30) = text
+    - Solid = loss, dashed = rank
 
-  Màu sắc giữ nguyên:
-    - Xanh dương (#378ADD): image
-    - Cam đỏ (#D85A30): text
-    - Solid: loss
-    - Dashed: rank
+  Figure phụ 1: Cosine similarity histogram overlay
+    - Before collapse vs after collapse
+    - Message: sau collapse, all representations nearly identical
 
-FIGURE PHỤ 1 — Pairwise cosine similarity distribution:
-  Type: Histogram overlay (before vs after collapse)
-  X-axis: cosine similarity (-1 đến 1)
-  Y-axis: frequency / density
-  Hai distribution:
-    - "Before collapse" (tại transition point): spread, centered ~0.1–0.3
-    - "After collapse" (cuối training): spike gần 1.0
-  Color: dùng opacity để overlay
-  Message: "Sau collapse, tất cả representations gần như giống hệt nhau"
-
-FIGURE PHỤ 2 — Downstream performance vs training steps:
-  Type: Line chart đơn giản
-  X-axis: training steps
-  Y-axis: task accuracy (hoặc STS-B correlation)
-  Hai đường: image probe accuracy, text probe accuracy
-  Expected pattern:
+  Figure phụ 2: Downstream probe accuracy theo steps
     - Image: tăng monotonically
-    - Text: tăng nhẹ → peak tại transition point → DROP sau collapse
-  Annotation: đánh dấu transition point bằng vertical line
-  Message: "Loss thấp sau collapse không correlate với useful representations"
+    - Text: tăng → peak tại transition → DROP
+    - Annotation: vertical line tại transition point
 
-FIGURE PHỤ 3 (optional, appendix) — Eigenvalue spectrum:
-  Type: Bar chart của top-k eigenvalues tại 3 timepoints
-  Timepoints: early training, transition point, after collapse
-  Expected: spectrum từ spread đều → concentrated trên vài eigenvalues
-  Message: visualize quá trình rank collapse qua eigenvalue geometry
+  Figure phụ 3 (appendix): Eigenvalue spectrum tại 3 timepoints
+    - Early / transition / after collapse
+    - Visualize rank collapse qua eigenvalue geometry
+
 
 --------------------------------------------------------------------------------
 PHẦN 3 — THIẾT KẾ THỰC NGHIỆM TỔNG THỂ
@@ -409,112 +245,83 @@ PHẦN 3 — THIẾT KẾ THỰC NGHIỆM TỔNG THỂ
 3.1 SETUP CHUNG
 ----------------
 
-Architecture:
-  - Context encoder: ViT-B/16 (hoặc nhỏ hơn nếu compute limited)
-  - Target encoder: EMA copy, τ = 0.996
-  - Predictor: narrow ViT, 4 blocks
-  - Embedding dimension d = 384 (hoặc 768)
+  Architecture:
+    Context encoder: ViT-H/14 (image), BERT-Large (text)
+    Target encoder: EMA copy, tau = 0.996
+    Predictor: narrow ViT, 12 blocks
+    Embed dim: 1280 (image), 1024 (text)
 
-Dataset:
-  - Image: ImageNet-1k (subset nếu cần) hoặc CIFAR-100
-  - Text: Wikipedia + BookCorpus (subset), tokenizer BPE với vocab 50k
+  Dataset:
+    Image: ImageNet-1k subset
+    Text: C4 subset, tokenizer BPE vocab 50k, max_length 256
 
-Masking strategy:
-  - Image: block masking, 75% masked (theo I-JEPA paper)
-  - Text: span masking, 30% masked (theo BERT-style, hoặc tương đương)
+  Masking:
+    Image: block masking 75–85% masked
+    Text: span masking, max 5 spans x 5 tokens
 
-Optimizer: AdamW, lr = 1e-3 với cosine decay
-Training: 100k steps (đủ để observe cả hai phases)
-
-Hardware estimate:
-  - 1–2 GPU (A100 hoặc tương đương) cho full run
-  - Hoặc smaller model + subset data nếu resource hạn chế
+  Optimizer: AdamW, lr = 1e-3 với cosine decay, 20 epochs
 
 
 3.2 LOGGING PROTOCOL
 ---------------------
 
-Tất cả log vào một file duy nhất (wandb hoặc tensorboard):
+  Mỗi log_every steps:
+    train/loss_image, train/loss_text
+    argI/MI_proxy_image, argI/MI_proxy_text
+    argI/residual_var_image, argI/residual_var_text
+    argII/effective_rank_image, argII/effective_rank_text
+    argII/lambda_min_image, argII/lambda_min_text
+    argII/lambda_min_ratio_image, argII/lambda_min_ratio_text
+    argII/cosine_sim_mean_text, argII/cosine_sim_std_text
+    argII/cosine_sim_p95_text, argII/cosine_sim_mean_image
 
-  Step-level (mỗi bước):
-    - train/loss_image
-    - train/loss_text
-
-  Checkpoint-level (mỗi 500 bước):
-    - geometry/effective_rank_image
-    - geometry/effective_rank_text
-    - geometry/lambda_min_image
-    - geometry/lambda_min_text
-
-  Heavy metrics (mỗi 1000 bước):
-    - geometry/cosine_sim_mean_text
-    - geometry/cosine_sim_std_text
-    - geometry/cosine_sim_mean_image
-    - geometry/cosine_sim_std_image
-
-  Probe metrics (mỗi 5000 bước):
-    - downstream/image_linear_probe_acc
-    - downstream/text_linear_probe_score
+  Mỗi 5000 steps:
+    downstream/image_probe_acc
+    downstream/text_probe_score
 
 
 3.3 DECISION TREE KHI ĐỌC KẾT QUẢ
 ------------------------------------
 
-Sau khi có data, đọc theo thứ tự sau:
-
-  BƯỚC 1: Nhìn loss curves
-    → loss_text plateau cao hơn loss_image không?
+  Bước 1: MI_proxy_text có plateau thấp hơn MI_proxy_image không?
     → Có: tiếp tục Bước 2
-    → Không: kiểm tra lại setup, có thể hyperparameters sai
+    → Không: kiểm tra lại setup
 
-  BƯỚC 2: Nhìn rank tại thời điểm loss plateau
-    → rank_text vẫn cao (> 30% max)?
-    → Có: CONFIRM ARGUMENT I. Report entropy ceiling.
-    → Không: rank đã thấp rồi → Arg II đã xảy ra trước, che mất Arg I
-             → Cần report Arg II, mention Arg I bị masked
+  Bước 2: residual_var_text có plateau trong khi image giảm đều không?
+    → Có + rank_text cao: CONFIRM ARGUMENT I
+    → Có + rank_text thấp: Arg II đã xảy ra, che mất Arg I → report Arg II
 
-  BƯỚC 3: Nhìn rank trajectory theo thời gian
-    → rank_text có giảm mạnh ở một điểm nào đó không?
-    → Có: xác định transition point. CONFIRM ARGUMENT II setup.
-    → Không: chỉ có Arg I, Arg II chưa xảy ra trong training window này
-             (có thể cần train lâu hơn, hoặc report là Arg II cần more steps)
+  Bước 3: rank_text có giảm mạnh ở một điểm nào đó không?
+    → Có: xác định transition point, tiếp tục Bước 4
+    → Không: chỉ có Arg I trong training window này
 
-  BƯỚC 4: Confirm Arg II bằng metrics phụ
-    → cosine similarity tăng lên sau transition point?
-    → downstream accuracy drop sau transition point?
-    → Có cả hai: STRONG CONFIRM ARGUMENT II
-    → Chỉ có một: MODERATE CONFIRM, cần thêm analysis
+  Bước 4: cosine_sim_mean tăng + probe accuracy drop sau transition không?
+    → Cả hai: STRONG CONFIRM ARGUMENT II
+    → Một trong hai: MODERATE CONFIRM, cần thêm analysis
 
-  BƯỚC 5: Kiểm tra sequential mechanism
-    → Transition point của rank_text có xảy ra SAU phase 1 plateau không?
+  Bước 5: Transition point xảy ra SAU Phase 1 plateau không?
     → Có: sequential mechanism supported (temporal claim)
-    → Không: hai hiện tượng xảy ra đồng thời, mechanism phức tạp hơn
+    → Không: hai hiện tượng đồng thời, mechanism phức tạp hơn
 
 
-3.4 CLAIM HIERARCHY THEO KẾT QUẢ
-----------------------------------
+3.4 CLAIM HIERARCHY
+---------------------
 
-Tùy vào kết quả observe được, paper có thể claim ở các mức độ khác nhau:
+  Mức 1 (conservative, always defensible):
+    "T-JEPA MI proxy saturates at a low ceiling while image MI continues to
+    increase, and residual variance does not decrease — consistent with the
+    irreducible entropy floor predicted by Proposition 4.5."
 
-  MỨC 1 (conservative, always defensible):
-    "We observe that T-JEPA loss plateaus at significantly higher values than
-    I-JEPA, while effective rank remains comparable — consistent with the
-    entropy ceiling predicted by Argument I."
+  Mức 2 (stronger, cần Điều kiện 1+2+3 của Arg II):
+    "After step X, effective rank of the text encoder collapses while MSE loss
+    decreases — consistent with Proposition 4.9. Downstream probe accuracy
+    confirms this loss decrease does not correspond to useful representations."
 
-  MỨC 2 (stronger, cần Điều kiện 1+2+3 của Arg II):
-    "We further observe that after step X, effective rank of the text encoder
-    collapses while loss decreases — consistent with the degenerate solution
-    described in Argument II. Downstream probe accuracy confirms that this
-    loss decrease does not correspond to improved representations."
-
-  MỨC 3 (strongest, cần thêm ablation):
+  Mức 3 (strongest, cần ablation):
     "The sequential observation — entropy ceiling preceding collapse — suggests
-    a causal mechanism: weak gradient from irreducible noise creates conditions
-    for collapse. We leave formal causal verification to future work."
+    a causal mechanism. We leave formal causal verification to future work."
 
-  GỢI Ý: Claim Mức 1 + Mức 2 trong body paper.
-          Mức 3 trong Discussion section.
-          Ablation experiment cho Mức 3 trong Future Work.
+  → Claim Mức 1 + Mức 2 trong body paper. Mức 3 trong Discussion.
 
 
 --------------------------------------------------------------------------------
@@ -524,53 +331,49 @@ PHẦN 4 — LƯU Ý KHI VIẾT PAPER
 4.1 CÁCH NỐI EMPIRICAL VỀ THEORETICAL
 ---------------------------------------
 
-Mỗi figure cần một câu nối rõ ràng:
-
   Arg I figure:
-    "Figure X confirms Proposition 4.5: the text loss plateau lies within
-    the predicted entropy floor of 3–5 bits/token, while high effective rank
-    rules out collapse as an alternative explanation."
+    "Figure X confirms Proposition 4.5: text MI proxy saturates at the
+    predicted entropy ceiling, while high effective rank rules out collapse."
 
   Arg II figure:
-    "Figure Y confirms Proposition 4.9: effective rank of the text encoder
-    collapses to near-degenerate levels after step X, with concurrent
-    decrease in downstream probe accuracy despite lower training loss."
+    "Figure Y confirms Proposition 4.9: effective rank collapses after step X,
+    with concurrent probe accuracy drop despite lower training loss."
+
 
 4.2 ĐIỀU CẦN TRÁNH
 --------------------
 
-  TRÁNH 1: Claim Arg I mà không kiểm tra rank
+  TRÁNH 1: Dùng MSE loss làm primary evidence của Arg I
+    → Loss không đo trực tiếp mutual information hay entropy
+    → Dùng MI proxy và residual variance thay thế
+
+  TRÁNH 2: Claim Arg I mà không check rank (điều kiện loại trừ)
     → Reviewer sẽ hỏi ngay: "làm sao biết đây không phải collapse?"
-    → Luôn report rank alongside loss
 
-  TRÁNH 2: Claim Arg II chỉ dựa trên loss curve
-    → Loss thấp có thể do nhiều nguyên nhân
-    → Phải có ít nhất rank + một metric phụ (cosine sim hoặc downstream)
+  TRÁNH 3: Claim Arg II chỉ dựa trên loss curve
+    → Phải có rank + ít nhất một metric phụ (cosine sim hoặc downstream)
 
-  TRÁNH 3: Claim causal mechanism mà không có ablation
-    → "Arg I causes Arg II" là causal claim cần controlled experiment
-    → Nếu không có ablation, chỉ được claim "Arg I precedes Arg II"
+  TRÁNH 4: Claim causal mechanism mà không có ablation
+    → Chỉ được claim "Arg I precedes Arg II", không phải "causes"
 
-  TRÁNH 4: Dùng final checkpoint để report
-    → Phải report trajectory (theo steps)
-    → Final checkpoint có thể đã collapse và không thấy Arg I nữa
+  TRÁNH 5: Dùng final checkpoint để report
+    → Phải report trajectory — final checkpoint có thể đã collapse
 
-4.3 ABLATION GỢI Ý (nếu có resource)
---------------------------------------
 
-  ABLATION A — Verify Arg I độc lập:
+4.3 ABLATION GỢI Ý
+--------------------
+
+  Ablation A — Verify Arg I độc lập:
     Train T-JEPA với VICReg regularization (prevent collapse)
-    → Nếu loss vẫn plateau cao dù rank được maintain → Arg I đứng độc lập
-    → Đây cũng là bước đầu cho Hybrid experiment
+    → Nếu MI vẫn plateau thấp dù rank được maintain → Arg I đứng độc lập
 
-  ABLATION B — Verify sequential mechanism:
-    Early stop T-JEPA tại transition point (trước collapse)
-    → Probe accuracy tại đây vs sau collapse
-    → Nếu accuracy drop sau collapse: confirms collapse hurts representations
+  Ablation B — Verify sequential mechanism:
+    Early stop T-JEPA tại transition point, probe accuracy so với sau collapse
+    → Accuracy drop sau collapse = confirms collapse hurts representations
 
-  ABLATION C — Scale experiment:
+  Ablation C — Scale experiment:
     Thử nhiều model sizes, datasets, masking ratios
-    → Nếu pattern consistent → findings không phải artifact của một setup cụ thể
+    → Pattern consistent = findings không phải artifact của một setup cụ thể
 
 ================================================================================
 END OF DOCUMENT
