@@ -82,7 +82,7 @@ CFG = dict(
     # training
     log_every       = 10,
     # ── HELD-OUT EVAL ─────────────────────────────────────────────────────
-    eval_every      = 100,
+    eval_every      = 400,
     eval_max_batches = None,
     # ── ARGUMENT I metrics ────────────────────────────────────────────────
     arg1_every       = 10,

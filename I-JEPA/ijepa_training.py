@@ -134,7 +134,7 @@ CFG = dict(
     log_every       = 10,
     # ── HELD-OUT EVAL ─────────────────────────────────────────────────────
     # Every eval_every steps: full val-split pass, all metrics, separate JSON
-    eval_every      = 100,
+    eval_every      = 400,
     eval_max_batches = None,   # None = full val set; set int to cap (faster debug)
     # Arg I metrics cadence (same as log_every by default)
     arg1_every      = 10,
