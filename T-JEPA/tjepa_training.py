@@ -235,16 +235,18 @@ def compute_residual_variance(
 
 @torch.no_grad()
 def compute_arg2_metrics(z_flat: torch.Tensor, embed_dim: int) -> dict:
-    z = z_flat.float()
+    z = z_flat.double()  # float64 ngay từ đầu, trước khi tính cov
 
     mean_z     = z.mean(dim=0, keepdim=True)
     z_centered = z - mean_z
     cov        = (z_centered.T @ z_centered) / max(z.shape[0] - 1, 1)
+
     try:
-        eigvals          = torch.linalg.eigvalsh(cov)
+        cov_sym          = (cov + cov.T) * 0.5
+        eigvals          = torch.linalg.eigvalsh(cov_sym)   # đã double, không cần cast
         lambda_min       = eigvals[0].item()
         lambda_max       = eigvals[-1].item()
-        lambda_min_ratio = (lambda_min / lambda_max) if abs(lambda_max) > 1e-12 else 0.0
+        lambda_min_ratio = (lambda_min / lambda_max) if lambda_max > 1e-12 else 0.0
     except Exception:
         lambda_min       = float("nan")
         lambda_min_ratio = float("nan")
@@ -257,7 +259,7 @@ def compute_arg2_metrics(z_flat: torch.Tensor, embed_dim: int) -> dict:
     else:
         z_sample = z
 
-    z_norm  = F.normalize(z_sample, p=2, dim=1)
+    z_norm  = F.normalize(z_sample.float(), p=2, dim=1)  # float32 đủ cho cosine sim
     sim_mat = z_norm @ z_norm.T
     S       = z_norm.shape[0]
     triu_idx = torch.triu_indices(S, S, offset=1, device=z.device)
@@ -279,7 +281,6 @@ def compute_arg2_metrics(z_flat: torch.Tensor, embed_dim: int) -> dict:
         cosine_sim_p95    = round(cosine_sim_p95,   6),
         cosine_sim_hist   = cosine_sim_hist,
     )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Held-out evaluation

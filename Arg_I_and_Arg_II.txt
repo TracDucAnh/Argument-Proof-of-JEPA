@@ -174,7 +174,6 @@ cơ chế tương đương (Prop 4.9).
 
   METRIC CHÍNH:
     effective_rank         — exp(H(lambda_i / sum(lambda_i))), đo theo steps
-    normalized_rank        — effective_rank / embed_dim, range 0–1
     MSE loss               — dùng để đối chiếu với rank trajectory
 
   METRICS PHỤ:

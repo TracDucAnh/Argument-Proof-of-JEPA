@@ -405,39 +405,23 @@ def compute_residual_variance(
 
 @torch.no_grad()
 def compute_arg2_metrics(z_flat: torch.Tensor, embed_dim: int) -> dict:
-    """
-    Compute Argument II collapse metrics from a flat [N, D] representation matrix.
+    z = z_flat.double()  # float64 ngay từ đầu, trước khi tính cov
 
-    Returns dict with:
-        lambda_min        — smallest eigenvalue of Σ_z (→0 = collapse direction)
-        lambda_min_ratio  — lambda_min / lambda_max  (→0 = degenerate subspace)
-        cosine_sim_mean   — mean pairwise cosine similarity
-        cosine_sim_std    — std  pairwise cosine similarity
-        cosine_sim_p95    — 95th-pct (shift toward 1.0 = collapse)
-        cosine_sim_hist   — 10-bin histogram over [-1, 1] as list[int]
-
-    Notes:
-        - eigvalsh on [D×D] cov matrix (float32, numerically stable)
-        - Cosine sim subsampled to arg2_sample_size to avoid O(N²) OOM
-        - Upper-triangle only (excludes self-similarity diagonal)
-    """
-    z = z_flat.float()
-
-    # ── λ_min of Σ_z ──────────────────────────────────────────────────────
     mean_z     = z.mean(dim=0, keepdim=True)
     z_centered = z - mean_z
     cov        = (z_centered.T @ z_centered) / max(z.shape[0] - 1, 1)
+
     try:
-        eigvals          = torch.linalg.eigvalsh(cov)
+        cov_sym          = (cov + cov.T) * 0.5
+        eigvals          = torch.linalg.eigvalsh(cov_sym)   # đã double, không cần cast
         lambda_min       = eigvals[0].item()
         lambda_max       = eigvals[-1].item()
-        lambda_min_ratio = (lambda_min / lambda_max) if abs(lambda_max) > 1e-12 else 0.0
+        lambda_min_ratio = (lambda_min / lambda_max) if lambda_max > 1e-12 else 0.0
     except Exception:
         lambda_min       = float("nan")
         lambda_min_ratio = float("nan")
 
-    # ── Pairwise cosine similarity (subsampled) ────────────────────────────
-    N           = z.shape[0]
+    N = z.shape[0]
     sample_size = min(N, CFG["arg2_sample_size"])
     if sample_size < N:
         idx      = torch.randperm(N, device=z.device)[:sample_size]
@@ -445,17 +429,18 @@ def compute_arg2_metrics(z_flat: torch.Tensor, embed_dim: int) -> dict:
     else:
         z_sample = z
 
-    z_norm   = F.normalize(z_sample, p=2, dim=1)
-    sim_mat  = z_norm @ z_norm.T
-    S        = z_norm.shape[0]
+    z_norm  = F.normalize(z_sample.float(), p=2, dim=1)  # float32 đủ cho cosine sim
+    sim_mat = z_norm @ z_norm.T
+    S       = z_norm.shape[0]
     triu_idx = torch.triu_indices(S, S, offset=1, device=z.device)
     sim_vals = sim_mat[triu_idx[0], triu_idx[1]]
 
-    sim_cpu         = sim_vals.cpu().float().numpy()
+    sim_cpu = sim_vals.cpu().float().numpy()
     cosine_sim_mean = float(np.mean(sim_cpu))
     cosine_sim_std  = float(np.std(sim_cpu))
     cosine_sim_p95  = float(np.percentile(sim_cpu, 95))
-    hist_counts, _  = np.histogram(sim_cpu, bins=10, range=(-1.0, 1.0))
+
+    hist_counts, _ = np.histogram(sim_cpu, bins=10, range=(-1.0, 1.0))
     cosine_sim_hist = hist_counts.tolist()
 
     return dict(
