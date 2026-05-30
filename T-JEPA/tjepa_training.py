@@ -274,8 +274,8 @@ def compute_arg2_metrics(z_flat: torch.Tensor, embed_dim: int) -> dict:
     cosine_sim_hist = hist_counts.tolist()
 
     return dict(
-        lambda_min        = round(lambda_min,       8),
-        lambda_min_ratio  = round(lambda_min_ratio, 8),
+        lambda_min        = float(f"{lambda_min:.6e}"),   # scientific notation, không round mất signal
+        lambda_min_ratio  = float(f"{lambda_min_ratio:.6e}"),
         cosine_sim_mean   = round(cosine_sim_mean,  6),
         cosine_sim_std    = round(cosine_sim_std,   6),
         cosine_sim_p95    = round(cosine_sim_p95,   6),
