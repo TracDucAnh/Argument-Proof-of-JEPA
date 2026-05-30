@@ -7,7 +7,6 @@
 #               + shaded entropy ceiling (cận trên lý thuyết của text MI)
 #   Ảnh phải  : Effective rank — dual-axis
 #               trục trái T-JEPA (cam đỏ), trục phải I-JEPA (xanh dương)
-#               (y hệt pattern draw_effective_rank.py)
 #
 # 3 output (train / val / train+val):
 #   mi_rank/plot1_mi_rank_train.png
@@ -40,10 +39,10 @@ STEP_CAP         = 15_000
 INSTABILITY_STEP = 9_340   # T-JEPA bắt đầu mất ổn định
 
 # ── Màu sắc (nhất quán với toàn bộ project) ──────────────────────────────────
-C_IJEPA_TRAIN = "#2563EB"   # blue-600
-C_IJEPA_VAL   = "#60A5FA"   # blue-400
-C_TJEPA_TRAIN = "#D85A30"   # orange-red
-C_TJEPA_VAL   = "#F4A07A"   # light orange
+C_IJEPA_TRAIN = "#60A5FA"    # blue-400
+C_IJEPA_VAL   = "#2563EB"  # blue-600
+C_TJEPA_TRAIN = "#F4A07A"   # light orange
+C_TJEPA_VAL   = "#D85A30"  # orange-red
 
 C_CEILING      = "#FDE68A"   # amber-200 — shaded entropy ceiling
 C_CEILING_EDGE = "#F59E0B"   # amber-400
@@ -52,19 +51,26 @@ C_INSTABILITY      = "#DC2626"   # red-600  — dashed line
 C_INSTABILITY_FILL = "#FCA5A5"   # red-300  — shaded region
 
 # ── Style ─────────────────────────────────────────────────────────────────────
-FONT_TITLE  = 12
-FONT_LABEL  = 10
-FONT_TICK   = 8.5
-FONT_LEGEND = 9
-FONT_ANNOT  = 8
+FONT_TITLE  = 18
+FONT_LABEL  = 16
+FONT_TICK   = 14
+FONT_LEGEND = 7.5       # smaller legend font
+FONT_ANNOT  = 10
 LW          = 1.7
 LW_VAL      = 2
 ALPHA_GRID  = 0.25
 ALPHA_SHADE = 1.0
-ALPHA_INSTAB = 0.15        # độ trong suốt vùng instability
-FIG_DPI     = 150
+ALPHA_INSTAB = 0.15
+FIG_DPI     = 300
 
-# ── Entropy ceiling (hằng số lý thuyết, KHÔNG infer từ data) ─────────────────
+# ── Plot 3 specific line weights ──────────────────────────────────────────────
+# val lines are bold, train lines are faded/thin
+LW_TRAIN_FADED = 1.0        # thin
+ALPHA_TRAIN    = 0.7       # very transparent
+LW_VAL_BOLD    = 2.5        # thick
+ALPHA_VAL      = 1.0        # fully opaque
+
+# ── Entropy ceiling ───────────────────────────────────────────────────────────
 CEILING_HI = 0.35
 
 
@@ -106,11 +112,12 @@ def add_instability_marker(ax, label: bool = True):
 # Panel trái: MI proxy — single axis + entropy ceiling shading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def draw_mi_panel(ax, entries: list[dict], title: str):
+def draw_mi_panel(ax, entries: list[dict], title: str, legend_loc: str = "upper left"):
     for e in entries:
         ax.plot(e["steps"], e["mi_proxy"],
                 color=e["color"], linewidth=e["lw"],
-                linestyle=e["ls"], label=e["label"])
+                linestyle=e["ls"], label=e["label"],
+                alpha=e.get("alpha", 1.0))
 
     # Shaded entropy ceiling
     ax.axhspan(0, CEILING_HI,
@@ -133,7 +140,6 @@ def draw_mi_panel(ax, entries: list[dict], title: str):
     ax.spines["right"].set_visible(False)
     ax.grid(True, alpha=ALPHA_GRID, linestyle="--")
 
-    # Instability marker
     add_instability_marker(ax, label=True)
 
     ceiling_patch = mpatches.Patch(
@@ -142,11 +148,13 @@ def draw_mi_panel(ax, entries: list[dict], title: str):
     )
     instab_line = plt.Line2D([0], [0], color=C_INSTABILITY, linewidth=1.5,
                               linestyle="--",
-                              label=f"T-JEPA instability (step {INSTABILITY_STEP:,})")
+                              label=f"T-JEPA instability ({INSTABILITY_STEP:,})")
     handles = [plt.Line2D([0], [0], color=e["color"], linewidth=e["lw"],
-                           linestyle=e["ls"], label=e["label"]) for e in entries]
+                           linestyle=e["ls"], label=e["label"],
+                           alpha=e.get("alpha", 1.0)) for e in entries]
     ax.legend(handles=handles + [ceiling_patch, instab_line],
-              fontsize=FONT_LEGEND, framealpha=0.88, loc="upper left")
+              fontsize=FONT_LEGEND, framealpha=0.85, loc=legend_loc,
+              borderpad=0.5, labelspacing=0.3, handlelength=1.5)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,13 +162,14 @@ def draw_mi_panel(ax, entries: list[dict], title: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def draw_rank_panel(ax, t_entries: list[dict], i_entries: list[dict],
-                    title: str, color_t: str, color_i: str):
-    # ── Trục trái: T-JEPA ──
+                    title: str, color_t: str, color_i: str,
+                    legend_loc: str = "upper right"):
     lines_t = []
     for e in t_entries:
         ln, = ax.plot(e["steps"], e["effective_rank"],
                       color=e["color"], linewidth=e["lw"],
-                      linestyle=e["ls"], label=e["label"])
+                      linestyle=e["ls"], label=e["label"],
+                      alpha=e.get("alpha", 1.0))
         lines_t.append(ln)
 
     ax.set_ylabel("T-JEPA Effective Rank", fontsize=FONT_LABEL, color=color_t)
@@ -172,13 +181,13 @@ def draw_rank_panel(ax, t_entries: list[dict], i_entries: list[dict],
     ax.set_xlabel("Training steps", fontsize=FONT_LABEL)
     ax.set_title(title, fontsize=FONT_TITLE, fontweight="bold")
 
-    # ── Trục phải: I-JEPA ──
     ax2 = ax.twinx()
     lines_i = []
     for e in i_entries:
         ln, = ax2.plot(e["steps"], e["effective_rank"],
                        color=e["color"], linewidth=e["lw"],
-                       linestyle=e["ls"], label=e["label"])
+                       linestyle=e["ls"], label=e["label"],
+                       alpha=e.get("alpha", 1.0))
         lines_i.append(ln)
 
     ax2.set_ylabel("I-JEPA Effective Rank", fontsize=FONT_LABEL, color=color_i)
@@ -186,18 +195,17 @@ def draw_rank_panel(ax, t_entries: list[dict], i_entries: list[dict],
     ax2.spines["right"].set_edgecolor(color_i)
     ax2.spines["top"].set_visible(False)
 
-    # Instability marker (vẽ trên ax chính — trục x chung)
     add_instability_marker(ax, label=True)
 
-    # Gộp legend
     instab_line = plt.Line2D([0], [0], color=C_INSTABILITY, linewidth=1.5,
                               linestyle="--",
-                              label=f"T-JEPA instability (step {INSTABILITY_STEP:,})")
+                              label=f"T-JEPA instability ({INSTABILITY_STEP:,})")
     all_lines = lines_t + lines_i
     ax.legend(handles=all_lines + [instab_line],
               labels=[ln.get_label() for ln in all_lines] +
-                     [f"T-JEPA instability (step {INSTABILITY_STEP:,})"],
-              fontsize=FONT_LEGEND, framealpha=0.88, loc="upper right")
+                     [f"T-JEPA instability ({INSTABILITY_STEP:,})"],
+              fontsize=FONT_LEGEND, framealpha=0.85, loc=legend_loc,
+              borderpad=0.5, labelspacing=0.3, handlelength=1.5)
 
     return ax2
 
@@ -278,6 +286,10 @@ def plot2_val():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Plot 3 — Train + Val
+# Val lines: bold & fully opaque
+# Train lines: thin & very transparent (alpha=0.30)
+# No suptitle; each subplot has its own compact title (no long dashes)
+# Smaller legend, repositioned
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot3_all():
@@ -288,38 +300,53 @@ def plot3_all():
 
     fig, (ax_mi, ax_rk) = plt.subplots(1, 2, figsize=(18, 5), dpi=FIG_DPI)
 
+    # ── MI Proxy panel ──
+    # Train entries: faded/thin  |  Val entries: bold/opaque
     draw_mi_panel(ax_mi, [
+        # train — faded, drawn first so val sits on top
         dict(steps=it["steps"], mi_proxy=it["mi_proxy"],
-             label="I-JEPA train", color=C_IJEPA_TRAIN, ls="-",  lw=LW),
-        dict(steps=iv["steps"], mi_proxy=iv["mi_proxy"],
-             label="I-JEPA val",   color=C_IJEPA_VAL,   ls="--", lw=LW_VAL),
+             label="I-JEPA train", color=C_IJEPA_TRAIN,
+             ls="-", lw=LW_TRAIN_FADED, alpha=ALPHA_TRAIN),
         dict(steps=tt["steps"], mi_proxy=tt["mi_proxy"],
-             label="T-JEPA train", color=C_TJEPA_TRAIN, ls="-",  lw=LW),
+             label="T-JEPA train", color=C_TJEPA_TRAIN,
+             ls="-", lw=LW_TRAIN_FADED, alpha=ALPHA_TRAIN),
+        # val — bold
+        dict(steps=iv["steps"], mi_proxy=iv["mi_proxy"],
+             label="I-JEPA val",   color=C_IJEPA_VAL,
+             ls="-", lw=LW_VAL_BOLD, alpha=ALPHA_VAL),
         dict(steps=tv["steps"], mi_proxy=tv["mi_proxy"],
-             label="T-JEPA val",   color=C_TJEPA_VAL,   ls="--", lw=LW_VAL),
-    ], title="MI Proxy — Train & Validation")
+             label="T-JEPA val",   color=C_TJEPA_VAL,
+             ls="-", lw=LW_VAL_BOLD, alpha=ALPHA_VAL),
+    ], title="MI Proxy (Train & Val)", legend_loc="upper left")
 
+    # ── Effective Rank panel ──
     draw_rank_panel(ax_rk,
         t_entries=[
+            # train — faded
             dict(steps=tt["steps"], effective_rank=tt["effective_rank"],
-                 label="T-JEPA train", color=C_TJEPA_TRAIN, ls="-",  lw=LW),
+                 label="T-JEPA train", color=C_TJEPA_TRAIN,
+                 ls="-", lw=LW_TRAIN_FADED, alpha=ALPHA_TRAIN),
+            # val — bold
             dict(steps=tv["steps"], effective_rank=tv["effective_rank"],
-                 label="T-JEPA val",   color=C_TJEPA_VAL,   ls="--", lw=LW_VAL),
+                 label="T-JEPA val",   color=C_TJEPA_VAL,
+                 ls="-", lw=LW_VAL_BOLD, alpha=ALPHA_VAL),
         ],
         i_entries=[
+            # train — faded
             dict(steps=it["steps"], effective_rank=it["effective_rank"],
-                 label="I-JEPA train", color=C_IJEPA_TRAIN, ls="-",  lw=LW),
+                 label="I-JEPA train", color=C_IJEPA_TRAIN,
+                 ls="-", lw=LW_TRAIN_FADED, alpha=ALPHA_TRAIN),
+            # val — bold
             dict(steps=iv["steps"], effective_rank=iv["effective_rank"],
-                 label="I-JEPA val",   color=C_IJEPA_VAL,   ls="--", lw=LW_VAL),
+                 label="I-JEPA val",   color=C_IJEPA_VAL,
+                 ls="-", lw=LW_VAL_BOLD, alpha=ALPHA_VAL),
         ],
-        title="Effective Rank — Train & Val (dual axis)",
+        title="Effective Rank (Train & Val, dual axis)",
         color_t=C_TJEPA_TRAIN, color_i=C_IJEPA_TRAIN,
+        legend_loc="upper right",
     )
 
-    fig.suptitle(
-        f"Argument I — Entropy Ceiling  [train + val, steps 0–{STEP_CAP:,}]",
-        fontsize=FONT_TITLE + 1, fontweight="bold", y=1.02,
-    )
+    # No suptitle — subplot titles carry all the context
     fig.tight_layout()
     out = OUT_DIR / "plot3_mi_rank_all.png"
     fig.savefig(out, dpi=FIG_DPI, bbox_inches="tight")
