@@ -67,3 +67,4 @@ venv/
 __pycache__
 data/
 *.png
+*.json
