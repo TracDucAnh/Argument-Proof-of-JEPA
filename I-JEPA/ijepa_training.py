@@ -33,6 +33,14 @@
 #   HELD-OUT EVALUATION (carried over):
 #     • Every eval_every steps: full val-split pass, all metrics, separate JSON.
 #
+#   EPOCH/ITER DISPLAY:
+#     • epoch and iter (it) are always derived from global_step + steps_per_epoch.
+#     • This guarantees correct display even when resuming from checkpoints, and
+#       prevents `it` from resetting to 1 every epoch in logs and JSON records.
+#     • Formula:
+#         epoch_display = (global_step // steps_per_epoch) + 1
+#         it_display    = (global_step %  steps_per_epoch) + 1
+#
 # I/O ORDERING GUARANTEE:
 #   Train JSON → Val JSON → PNG → Checkpoint (epoch-end only)
 #
@@ -137,6 +145,20 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Epoch/iter helpers — always derived from global_step, never from loop vars
+# ─────────────────────────────────────────────────────────────────────────────
+
+def epoch_of(global_step: int, steps_per_epoch: int) -> int:
+    """1-based epoch number derived from global_step."""
+    return (global_step // steps_per_epoch) + 1
+
+
+def iter_of(global_step: int, steps_per_epoch: int) -> int:
+    """1-based iteration-within-epoch derived from global_step."""
+    return (global_step % steps_per_epoch) + 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -461,7 +483,7 @@ def run_held_out_eval(
     val_loader,
     device: torch.device,
     global_step: int,
-    epoch: int,
+    epoch: int,          # pre-derived via epoch_of(); passed in for the record
     moco_queue: "MoCoQueue",
 ) -> dict:
     context_encoder.eval()
@@ -936,6 +958,13 @@ def train():
     total_steps     = CFG["epochs"] * steps_per_epoch
     lr_sched, wd_sched, ema_sched = get_lr_wd_ema_schedulers(total_steps, steps_per_epoch)
 
+    # ── Log the resolved epoch/step sizes once so mismatches are obvious ──
+    log.info(
+        f"steps_per_epoch={steps_per_epoch}  "
+        f"total_steps={total_steps}  "
+        f"epochs={CFG['epochs']}"
+    )
+
     train_records      = []
     val_records        = []
     arg3_train_records = []
@@ -944,19 +973,34 @@ def train():
 
     epoch_bar = tqdm(range(1, CFG["epochs"] + 1), desc="Epochs", unit="ep", position=0)
 
-    for epoch in epoch_bar:
+    for _epoch_loop_var in epoch_bar:
+        # ── epoch and iter are always derived from global_step ─────────────
+        # _epoch_loop_var is only used to drive the outer loop count.
+        # All logging, records, and display use epoch_of() / iter_of() so
+        # they remain correct after checkpoint resumes and across epoch boundaries.
+
         context_encoder.train()
         predictor.train()
         target_encoder.eval()
         epoch_losses = []
 
+        ep_display_start = epoch_of(global_step, steps_per_epoch)
+
         iter_bar = tqdm(
-            enumerate(loader, start=1),
-            total=len(loader), desc=f"Ep {epoch:03d}", unit="it",
-            position=1, leave=False, dynamic_ncols=True,
+            loader,
+            total=len(loader),
+            desc=f"Ep {ep_display_start:03d}",
+            unit="it",
+            position=1,
+            leave=True,
+            dynamic_ncols=True,
         )
 
-        for it, (imgs, masks_enc, masks_pred) in iter_bar:
+        for imgs, masks_enc, masks_pred in iter_bar:
+            # ── Derive epoch and iter from global_step ────────────────────
+            ep = epoch_of(global_step, steps_per_epoch)   # 1-based, never resets
+            it = iter_of(global_step, steps_per_epoch)    # 1-based within epoch
+
             current_lr  = lr_sched[global_step]
             current_wd  = wd_sched[global_step]
             current_ema = ema_sched[global_step]
@@ -1007,6 +1051,8 @@ def train():
                 lr=f"{current_lr:.5f}",
                 tau=f"{current_ema:.4f}",
                 q=f"{len(moco_queue)}",
+                ep=ep,
+                it=it,
                 step=global_step,
             )
 
@@ -1018,8 +1064,8 @@ def train():
 
                 record = dict(
                     global_step         = global_step,
-                    epoch               = epoch,
-                    iter                = it,
+                    epoch               = ep,   # derived from global_step
+                    iter                = it,   # derived from global_step
                     split               = "train",
                     loss                = round(loss.item(),                      6),
                     effective_rank      = round(rank_info["effective_rank"],      4),
@@ -1050,7 +1096,7 @@ def train():
                     arg2 = compute_arg2_metrics(z_flat, embed_dim=CFG["embed_dim"])
                     record.update(arg2)
                     log.info(
-                        f"[TRAIN ep {epoch:03d}|it {it:04d}|step {global_step:06d}]  "
+                        f"[TRAIN ep {ep:03d}|it {it:04d}|step {global_step:06d}]  "
                         f"loss={loss.item():.4f}  "
                         f"eff_rank={rank_info['effective_rank']:.2f}  "
                         f"norm_rank={rank_info['normalized_rank']:.4f}  "
@@ -1062,7 +1108,7 @@ def train():
                     )
                 else:
                     log.info(
-                        f"[TRAIN ep {epoch:03d}|it {it:04d}|step {global_step:06d}]  "
+                        f"[TRAIN ep {ep:03d}|it {it:04d}|step {global_step:06d}]  "
                         f"loss={loss.item():.4f}  "
                         f"eff_rank={rank_info['effective_rank']:.2f}  "
                         f"norm_rank={rank_info['normalized_rank']:.4f}  "
@@ -1076,15 +1122,13 @@ def train():
                 log.info(f"  → Running held-out eval at step {global_step} ...")
                 val_record = run_held_out_eval(
                     context_encoder, predictor, target_encoder,
-                    val_loader, device, global_step, epoch,
-                    moco_queue,
+                    val_loader, device, global_step,
+                    epoch=ep,   # derived from global_step
+                    moco_queue=moco_queue,
                 )
                 val_records.append(val_record)
 
             # ── Argument III: irreducible variance every arg3_every steps ──
-            # Uses frozen target encoder only — predictor not involved.
-            # K augmented crops of the same image → within-context variance.
-            # tqdm bar at position=3 shows progress over N_ctx contexts.
             if global_step % CFG["arg3_every"] == 0:
                 log.info(f"  → Computing Arg III irreducible variance at step {global_step} ...")
 
@@ -1101,7 +1145,7 @@ def train():
                 )
                 arg3_train_records.append(dict(
                     global_step = global_step,
-                    epoch       = epoch,
+                    epoch       = ep,   # derived from global_step
                     split       = "train",
                     model       = "I-JEPA",
                     irred_var   = arg3_train["irred_var"],
@@ -1121,7 +1165,7 @@ def train():
                 )
                 arg3_val_records.append(dict(
                     global_step = global_step,
-                    epoch       = epoch,
+                    epoch       = ep,   # derived from global_step
                     split       = "val",
                     model       = "I-JEPA",
                     irred_var   = arg3_val["irred_var"],
@@ -1143,9 +1187,11 @@ def train():
 
             global_step += 1
 
+        # ── End of epoch summary ──────────────────────────────────────────
+        finished_ep  = epoch_of(global_step - 1, steps_per_epoch)
         mean_ep_loss = sum(epoch_losses) / len(epoch_losses)
-        log.info(f"── Epoch {epoch:03d} complete  mean_loss={mean_ep_loss:.4f}")
-        epoch_bar.set_postfix(mean_loss=f"{mean_ep_loss:.4f}")
+        log.info(f"── Epoch {finished_ep:03d} complete  mean_loss={mean_ep_loss:.4f}")
+        epoch_bar.set_postfix(mean_loss=f"{mean_ep_loss:.4f}", ep=finished_ep)
 
         log.info("Saving records (Train JSON → Val JSON → PNG) …")
         save_records(train_records, val_records, arg3_train_records, arg3_val_records)
@@ -1154,11 +1200,17 @@ def train():
         save_checkpoint(
             CKPT_PATH,
             context_encoder, predictor, target_encoder,
-            optimiser, epoch, global_step,
-            train_records, val_records,
-            arg3_train_records, arg3_val_records,
-            lr_sched, wd_sched, ema_sched,
-            moco_queue,
+            optimiser,
+            epoch       = finished_ep,   # derived, not loop var
+            global_step = global_step,
+            train_records      = train_records,
+            val_records        = val_records,
+            arg3_train_records = arg3_train_records,
+            arg3_val_records   = arg3_val_records,
+            lr_sched    = lr_sched,
+            wd_sched    = wd_sched,
+            ema_sched   = ema_sched,
+            queue       = moco_queue,
         )
         log.info(f"Checkpoint saved → {CKPT_PATH}")
 
