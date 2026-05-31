@@ -392,8 +392,8 @@ def compute_arg3_irreducible_variance(
         except StopIteration:
             break
 
-        input_ids      = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        input_ids      = batch["clean_input_ids"].to(device)
+        attention_mask = batch["clean_attention_mask"].to(device)
         span_mask      = batch["span_mask"].to(device)
 
         B, L   = input_ids.shape
