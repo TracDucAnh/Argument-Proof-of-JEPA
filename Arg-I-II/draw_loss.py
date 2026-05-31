@@ -50,7 +50,7 @@ FONT_TITLE   = 18
 FONT_LABEL   = 16
 FONT_TICK    = 14
 FONT_LEGEND  = 10
-FONT_ANNOT   = 12
+FONT_ANNOT   = 8
 FONT_POINT   = 13          # size cho point annotations
 LW           = 1.7
 LW_VAL       = 2
@@ -98,7 +98,7 @@ def add_instability_marker(ax, label: bool = True):
         f"T-JEPA instability\nstep {INSTABILITY_STEP:,}",
         xy=(INSTABILITY_STEP, ymax),
         xytext=(INSTABILITY_STEP - 300, ymax),
-        fontsize=FONT_ANNOT,
+        fontsize=FONT_ANNOT - 8,
         color=C_INSTABILITY,
         va="top",
         ha="right",

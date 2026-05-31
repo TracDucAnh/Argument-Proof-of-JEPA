@@ -1,0 +1,461 @@
+================================================================================
+THIẾT KẾ THÍ NGHIỆM: ARGUMENT III — BIAS–VARIANCE DECOMPOSITION
+Paper: "Why JEPA Works on Images but Fails on Text"
+================================================================================
+
+--------------------------------------------------------------------------------
+PHẦN 0 — VỊ TRÍ CỦA ARGUMENT III TRONG FAILURE CASCADE
+--------------------------------------------------------------------------------
+
+Argument III không phải bước tiếp theo trong một chuỗi nhân quả tuyến tính,
+mà là một cơ chế song song và nền tảng hơn:
+
+    Argument III (irreducible variance)  ← cơ chế gốc rễ, active từ bước 0
+         ↓ gây ra
+    Argument I (entropy ceiling)         ← biểu hiện ở cấp MI / information
+         ↓ trigger
+    Argument II (collapse)               ← biểu hiện ở cấp representation geometry
+
+Vì vậy Argument III cần được validate ĐỘC LẬP với Arg I và Arg II — không phụ
+thuộc vào việc collapse đã xảy ra hay chưa. Toàn bộ measurement phải được thực
+hiện TRƯỚC bước collapse (step 9,340 trong experiment hiện tại).
+
+Câu hỏi cốt lõi của Arg III:
+    "Irreducible variance Var(z* | z_C, p_j) của text có lớn và không giảm được
+    hay không — bất kể predictor mạnh đến đâu và training lâu đến đâu?"
+
+
+--------------------------------------------------------------------------------
+PHẦN 1 — INTUITION VÀ CLAIM CẦN VALIDATE
+--------------------------------------------------------------------------------
+
+1.1 CLAIM CHÍNH
+----------------
+
+  Claim A (định lượng): Irreducible variance của text lớn hơn của image một cách
+    có hệ thống và không giảm theo training steps.
+    Biểu thức: Var(z* | z_C, p_j) >= delta_spread * H(x^(j) | x_C) > 0
+
+  Claim B (hệ quả centroid): Khi predictor converge, predicted representation
+    z_hat_T của text không khớp với bất kỳ real token embedding nào —
+    nó là convex combination của các token semantically khác nhau.
+    Biểu thức: min_{v in V} ||z_hat_T - f_theta_bar(v)||^2 lớn với text,
+               nhỏ với image.
+
+  Claim C (gradient quality): Gradient signal của text bị dominated bởi
+    irreducible noise từ đầu training, không phải bởi reducible error có ý nghĩa.
+    Biểu thức: SNR_grad = ||grad_reducible||^2 / ||grad_irreducible||^2
+               thấp và plateau với text, cao và tăng với image.
+
+
+1.2 TẠI SAO KHÔNG ĐO TRỰC TIẾP TỪ LOSS?
+------------------------------------------
+
+  MSE loss = Approximation error + Irreducible variance (Proposition A.10/5.1)
+
+  Vấn đề: loss tổng không tách được hai thành phần. Predictor tốt sẽ drive
+  approximation error → 0, nhưng irreducible variance vẫn còn đó — và chính nó
+  là sàn không thể vượt qua. Cần đo riêng từng phần.
+
+  Cách tách: dùng MULTIPLE COMPLETIONS cho cùng một context.
+  - Cùng một context x_C → sample K completions hợp lệ khác nhau
+  - Tính variance của {f_theta_bar(x^(k))}_{k=1}^K tại position j
+  - Đây chính là empirical estimate của Var(z* | x_C, p_j)
+  - Không bị confound bởi predictor capacity
+
+
+--------------------------------------------------------------------------------
+PHẦN 2 — METRICS CẦN ĐO (BA TẦNG)
+--------------------------------------------------------------------------------
+
+2.1 TẦNG 1: RESIDUAL VARIANCE PROXY (METRIC CHÍNH)
+----------------------------------------------------
+
+  Đây là estimate trực tiếp nhất của irreducible variance.
+
+  PROTOCOL:
+    Với mỗi held-out context x_C trong validation set:
+      1. Tạo K completions hợp lệ x^(1), ..., x^(K) bằng cách:
+           Image: K augmented crops của target patches
+                  (colour jitter sigma=0.2, rotation +-5 deg, no flip)
+           Text:  Sample K tokens từ p_BERT(. | x_C) tại position j
+                  (temperature=1.0, lấy top-K tokens với p > epsilon=0.01)
+      2. Forward qua frozen target encoder f_theta_bar:
+           z^*(k) = f_theta_bar(x^(k))^(j)  cho k = 1,...,K
+      3. Tính empirical variance:
+           z_bar = (1/K) * sum_k z^*(k)
+           residual_var(x_C) = (1/K) * sum_k ||z^*(k) - z_bar||^2
+
+    Aggregate: lấy mean over N_context = 200 held-out contexts.
+
+  METRICS LOG:
+    residual_var_text   — mean Var(z* | x_C) trên 200 contexts, text
+    residual_var_image  — mean Var(z* | x_C) trên 200 contexts, image
+    residual_var_ratio  — residual_var_text / residual_var_image
+
+  LOG FREQUENCY: mỗi 500 steps, bắt đầu từ step 0 (trước training)
+
+  HYPERPARAMETERS:
+    K = 16 completions (đủ để estimate variance, không quá tốn compute)
+    N_context = 200 contexts
+    Representations detached, frozen target encoder
+
+
+2.2 TẦNG 2: CENTROID VALIDITY — DISTANCE TO NEAREST EMBEDDING
+--------------------------------------------------------------
+
+  Validate Proposition 6.2/A.12: predicted representation z_hat_T của text
+  là centroid vô nghĩa — không khớp với bất kỳ real token/patch nào.
+
+  PROTOCOL:
+    Sau khi predictor đã converge (dùng checkpoint trước step 9,340):
+      1. Với mỗi held-out context x_C:
+           z_hat_T = g_phi(f_theta(x_C), p_j)  — predicted representation
+      2. Tính khoảng cách đến nearest embedding:
+
+         Image:
+           delta_centroid = min_{i in patches} ||z_hat_T - f_theta_bar(x)^(i)||^2
+           (nearest patch representation trong cùng image)
+
+         Text:
+           delta_centroid = min_{v in V_active} ||z_hat_T - f_theta_bar(v)||^2
+           V_active = top-500 token embeddings theo frequency trong validation set
+           (tránh scan toàn bộ vocab 50K mỗi step)
+
+    Aggregate: mean delta_centroid trên 200 contexts.
+
+  METRICS LOG:
+    centroid_dist_text   — mean distance to nearest token embedding, text
+    centroid_dist_image  — mean distance to nearest patch embedding, image
+    centroid_dist_ratio  — centroid_dist_text / centroid_dist_image
+
+  LOG FREQUENCY: mỗi 1000 steps (tốn compute hơn do nearest neighbor search)
+
+  GHI CHÚ:
+    - Chỉ có ý nghĩa SAU KHI predictor đã có training signal (step >= 1000)
+    - Nên report tại 3 checkpoints: early / mid / pre-collapse
+    - Không cần log liên tục — snapshot tại 3 điểm là đủ
+
+
+2.3 TẦNG 3: GRADIENT SIGNAL-TO-NOISE RATIO
+-------------------------------------------
+
+  Validate rằng gradient của text bị dominated bởi irreducible noise.
+
+  ĐỊNH NGHĨA:
+    Với mỗi training step:
+      grad_total = gradient của LJEPA w.r.t. theta (context encoder)
+      grad_reducible = gradient của E[||g_phi - z_bar||^2] w.r.t. theta
+                     = gradient khi z* được thay bằng z_bar (conditional mean)
+      grad_irreducible = grad_total - grad_reducible
+
+    SNR_grad = ||grad_reducible||^2 / (||grad_irreducible||^2 + eps)
+
+  APPROXIMATION (vì z_bar không biết trực tiếp):
+    Dùng z_hat_T thay cho z_bar (sau khi predictor converge, z_hat_T ≈ z_bar)
+    grad_reducible ≈ gradient của ||g_phi(z_C, p_j) - z_hat_T||^2 w.r.t. theta
+    grad_irreducible ≈ gradient của ||z_hat_T - z*||^2 w.r.t. theta
+    (trong đó z* = f_theta_bar(x)^(j) là target thực)
+
+  METRICS LOG:
+    snr_grad_text   — SNR_grad trung bình trên validation batch, text
+    snr_grad_image  — SNR_grad trung bình trên validation batch, image
+    grad_norm_text  — ||grad_total|| để phát hiện gradient explosion/vanishing
+    grad_norm_image — ||grad_total||
+
+  LOG FREQUENCY: mỗi 200 steps (nhẹ về compute)
+
+  QUAN TRỌNG:
+    - Gradient SNR cần được đo trên VALIDATION batch (không phải train)
+    - Chỉ có ý nghĩa sau bước warmup (step >= 500)
+    - Nếu SNR_grad_text thấp ngay từ đầu và không tăng → direct evidence Arg III
+
+
+--------------------------------------------------------------------------------
+PHẦN 3 — ĐIỀU KIỆN XÁC NHẬN ARGUMENT III
+--------------------------------------------------------------------------------
+
+3.1 ĐIỀU KIỆN XÁC NHẬN (CẦN ĐỦ)
+----------------------------------
+
+  [CHÍNH] Điều kiện 1 — residual_var_text >> residual_var_image từ step 0:
+    Đây là direct evidence của Proposition A.12/5.3.
+    Ngưỡng: residual_var_ratio > 5x trong suốt training
+    Ý nghĩa: irreducible variance của text lớn hơn image một cách có hệ thống
+
+  [CHÍNH] Điều kiện 2 — residual_var_text KHÔNG GIẢM theo training steps:
+    Phân biệt với approximation error (giảm theo training).
+    Quan sát: residual_var_text tại step 5000 ≈ residual_var_text tại step 0
+    Ý nghĩa: đây thực sự là irreducible noise, không phải predictor chưa đủ tốt
+
+  [PHỤ] Điều kiện 3 — centroid_dist_text >> centroid_dist_image:
+    Validate Proposition 6.2: predicted representations của text không khớp
+    với bất kỳ real token nào.
+    Ngưỡng: centroid_dist_ratio > 3x tại mid-training checkpoint
+
+  [PHỤ] Điều kiện 4 — snr_grad_text thấp và plateau, snr_grad_image cao và tăng:
+    Validate cơ chế gradient corruption.
+    Ngưỡng: SNR_grad_text < 0.1, SNR_grad_image > 1.0 (sau bước warmup)
+
+
+3.2 ĐIỀU KIỆN LOẠI TRỪ (TRÁNH FALSE CLAIM)
+--------------------------------------------
+
+  LOẠI TRỪ 1: Đảm bảo residual_var được đo TRƯỚC khi collapse (step < 9,340)
+    → Sau collapse, cả hai encoders đều degenerate, variance mất ý nghĩa
+
+  LOẠI TRỪ 2: Verify K completions của text thực sự diverse về mặt semantic
+    → Sample từ top-K với p > 0.01, không chỉ lấy argmax
+    → Nếu completions không diverse: variance nhỏ giả tạo
+
+  LOẠI TRỪ 3: Dùng frozen target encoder khi tính residual_var
+    → Nếu target encoder đang thay đổi (không frozen): variance bị confound
+
+  LOẠI TRỪ 4: Centroid distance phải được tính SAU KHI predictor converge
+    → Trước khi predictor tốt: z_hat_T random, distance không có ý nghĩa
+    → Checkpoint phù hợp: step 3,000–7,000 (sau warmup, trước collapse)
+
+
+--------------------------------------------------------------------------------
+PHẦN 4 — EXPECTED RESULTS VÀ INTERPRETATION
+--------------------------------------------------------------------------------
+
+4.1 EXPECTED RESULTS
+---------------------
+
+  Step 0 (baseline trước training):
+    residual_var_text:   cao (~0.5–2.0) do lexical ambiguity của BERT embeddings
+    residual_var_image:  thấp (~0.05–0.2) do spatial smoothness
+    residual_var_ratio:  > 5x
+    centroid_dist_text:  chưa có ý nghĩa (predictor chưa train)
+    snr_grad:            chưa có ý nghĩa
+
+  Step 500–3000 (sau warmup, predictor bắt đầu converge):
+    residual_var_text:   vẫn cao, không giảm (KEY OBSERVATION)
+    residual_var_image:  có thể giảm nhẹ khi encoder học được smoothness tốt hơn
+    snr_grad_text:       thấp (<0.1), plateau
+    snr_grad_image:      tăng dần (>1.0)
+
+  Step 3000–7000 (pre-collapse window, tốt nhất để report centroid):
+    residual_var_text:   vẫn cao, stable (xác nhận irreducible)
+    centroid_dist_text:  lớn (predictor đã converge nhưng vẫn output centroid)
+    centroid_dist_image: nhỏ (predicted patches gần với real patch embeddings)
+    centroid_dist_ratio: > 3x
+
+  Step > 9,340 (sau collapse — KHÔNG dùng để validate Arg III):
+    Tất cả metrics mất ý nghĩa vì encoder đã degenerate
+
+
+4.2 KEY OBSERVATIONS ĐỂ REPORT
+--------------------------------
+
+  Observation A:
+    "residual_var_text không giảm từ step 0 đến step 7,000, trong khi
+    residual_var_image giảm dần — consistent với Proposition A.12: irreducible
+    variance của text bị bounded below bởi delta_spread * H(x^(j) | x_C) > 0."
+
+  Observation B:
+    "centroid_dist_text tại pre-collapse checkpoint lớn gấp Xx so với image,
+    xác nhận Proposition 6.2: predicted representations của T-JEPA là convex
+    combination của token embeddings không tương ứng với bất kỳ real token nào."
+
+  Observation C:
+    "SNR_grad của T-JEPA thấp và plateau ngay từ đầu training, cho thấy gradient
+    signal bị dominated bởi irreducible noise — trực tiếp validate Consequence III."
+
+
+--------------------------------------------------------------------------------
+PHẦN 5 — THIẾT KẾ VISUALIZATION
+--------------------------------------------------------------------------------
+
+5.1 FIGURE CHÍNH: RESIDUAL VARIANCE TRAJECTORY
+------------------------------------------------
+
+  Loại: dual-axis line chart (tương tự Figure 1 của Arg I)
+  X-axis: training steps (0 đến 9,000 — dừng trước collapse)
+  Y-axis trái: residual_var (absolute, not normalized)
+  Y-axis phải: effective rank (để loại trừ collapse confound)
+
+  Bốn đường:
+    image residual_var (solid xanh)
+    text residual_var  (solid cam)
+    image effective rank (dashed xanh)
+    text effective rank  (dashed cam)
+
+  Annotation:
+    a) Shaded region nằm ngang: dải variance dự đoán từ delta_spread * H(text)
+    b) Chú thích tại text curve: "Irreducible — does not decrease with training"
+    c) Vertical dashed line: "Pre-collapse window (steps 3k–7k)"
+
+  Message: text variance không giảm dù predictor được train; image variance nhỏ
+  và giảm thêm khi encoder học được spatial structure tốt hơn.
+
+
+5.2 FIGURE PHỤ 1: CENTROID DISTANCE COMPARISON
+------------------------------------------------
+
+  Loại: grouped bar chart tại 3 checkpoints
+  X-axis: early (step 1,000) / mid (step 5,000) / pre-collapse (step 8,000)
+  Y-axis: delta_centroid (mean distance to nearest embedding)
+  Hai bars mỗi checkpoint: image (xanh) và text (cam)
+
+  Message: text predictor luôn output vectors xa nearest token embedding;
+  image predictor output vectors gần nearest patch embedding.
+
+
+5.3 FIGURE PHỤ 2: GRADIENT SNR TRAJECTORY
+-------------------------------------------
+
+  Loại: line chart
+  X-axis: training steps (200–9,000)
+  Y-axis: SNR_grad (log scale nếu ratio lớn)
+  Hai đường: image (xanh) và text (cam)
+
+  Annotation: horizontal dashed line tại SNR = 1.0 (breakeven point)
+  Message: T-JEPA's gradient SNR stays below breakeven throughout training.
+
+
+5.4 FIGURE PHỤ 3 (APPENDIX): COMPLETION DIVERSITY VISUALIZATION
+-----------------------------------------------------------------
+
+  Để justify rằng K completions thực sự diverse:
+    Image: show K=4 augmented crops cùng context — visually similar nhưng khác
+    Text:  show top-K token candidates với probabilities cho 5 example contexts
+    Ví dụ: "The cat sat on the ___" → {mat: 0.12, floor: 0.09, chair: 0.08, ...}
+
+  Message: text có nhiều completions hợp lệ với prob xấp xỉ nhau →
+  variance lớn là do data, không phải do augmentation artifacts.
+
+
+--------------------------------------------------------------------------------
+PHẦN 6 — LOGGING PROTOCOL ĐẦY ĐỦ
+--------------------------------------------------------------------------------
+
+6.1 METRICS TABLE
+------------------
+
+  Mỗi 200 steps (nhẹ):
+    argIII/snr_grad_text
+    argIII/snr_grad_image
+    argIII/grad_norm_text
+    argIII/grad_norm_image
+
+  Mỗi 500 steps (trung bình):
+    argIII/residual_var_text    (K=16 completions, N=200 contexts)
+    argIII/residual_var_image   (K=16 completions, N=200 contexts)
+    argIII/residual_var_ratio
+
+  Mỗi 1000 steps (nặng, chỉ cần đến step 9,000):
+    argIII/centroid_dist_text
+    argIII/centroid_dist_image
+    argIII/centroid_dist_ratio
+
+  Snapshot tại 3 checkpoints cố định (step 1,000 / 5,000 / 8,000):
+    argIII/completion_diversity_text  (std of K completions per context)
+    argIII/completion_diversity_image
+
+
+6.2 GHI CHÚ IMPLEMENTATION
+----------------------------
+
+  1. Residual variance phải dùng FROZEN target encoder f_theta_bar
+     → detach() trước khi tính variance
+
+  2. K completions của text: sample từ BERT masked LM head với temperature=1.0
+     → không phải từ context encoder đang train (sẽ bị confound với Arg I)
+
+  3. Centroid distance của text: dùng top-500 tokens (theo frequency) thay vì
+     full vocab 50K để tiết kiệm compute
+
+  4. Tất cả metrics tính trên VALIDATION set — không phải training set
+     → Consistent với quy tắc chung của paper
+
+  5. Dừng log Arg III metrics tại step 9,000 (trước collapse)
+     → Sau collapse, metrics không còn validate Arg III mà chỉ phản ánh Arg II
+
+
+--------------------------------------------------------------------------------
+PHẦN 7 — CLAIM HIERARCHY VÀ CÁCH NỐI VỀ THEORETICAL
+--------------------------------------------------------------------------------
+
+7.1 CLAIM HIERARCHY
+---------------------
+
+  Mức 1 (conservative, defensible với chỉ Điều kiện 1+2):
+    "residual_var_text không giảm theo training, trong khi residual_var_image
+    giảm — consistent với Proposition A.12: irreducible variance bị lower bounded
+    bởi lexical ambiguity và không thể reduce bởi predictor capacity."
+
+  Mức 2 (stronger, cần Điều kiện 1+2+3):
+    "Predicted representations của T-JEPA lie far from any real token embedding
+    (centroid_dist_text >> centroid_dist_image), xác nhận Proposition 6.2:
+    the optimal predictor degenerates to a semantically invalid centroid."
+
+  Mức 3 (strongest, cần cả 4 điều kiện):
+    "Gradient SNR của T-JEPA thấp từ bước đầu tiên, xác nhận rằng irreducible
+    noise — không phải collapse hay architectural limitation — là root cause
+    của training failure."
+
+  → Claim Mức 1 + Mức 2 trong body paper.
+  → Mức 3 trong Appendix.
+
+
+7.2 CÁCH NỐI VỀ THEORETICAL
+------------------------------
+
+  Residual variance figure:
+    "Figure X confirms Propositions A.11–A.12: residual_var_text remains
+    consistently large (> Y) and does not decrease with training, instantiating
+    Var(z* | z_C, p_j) >= delta_spread * H(x^(j) | x_C) from Proposition A.12.
+    Image residual variance remains small (< Z), consistent with
+    sigma^2_texture from Proposition A.11."
+
+  Centroid distance:
+    "Figure Y confirms Proposition 6.2: T-JEPA's predictor outputs representations
+    at mean distance D from any real token embedding, while I-JEPA's predictor
+    remains near actual patch representations. This is the geometric signature
+    of centroid degeneracy predicted by Equation (13)."
+
+
+7.3 CONNECTION TO ARG I AND ARG II
+------------------------------------
+
+  Phân biệt rõ trong paper:
+    Arg III → Arg I: irreducible variance là cơ chế gây ra entropy ceiling.
+      "The large irreducible variance (Arg III) is the mechanism through which
+      the entropy floor (Arg I) manifests: each valid token continuation
+      contributes to both the entropy of x^(j) | x_C and the variance of z*."
+
+    Arg III → Arg II: irreducible variance là nguyên nhân của collapse.
+      "With gradient signal dominated by irreducible noise (Arg III),
+      the optimizer has no incentive to maintain representational spread,
+      eventually finding the loss-free degenerate solution (Arg II)."
+
+  Temporal claim: Arg III active từ step 0, Arg I observable từ step 0,
+  Arg II xảy ra tại step 9,340 — ordering này support causal narrative.
+
+
+--------------------------------------------------------------------------------
+PHẦN 8 — ĐIỀU CẦN TRÁNH
+--------------------------------------------------------------------------------
+
+  TRÁNH 1: Đo residual variance sau collapse
+    → Sẽ thấy variance thấp giả tạo (encoder đã map everything to constant)
+
+  TRÁNH 2: Dùng argmax completion thay vì sampling cho text
+    → Sẽ chỉ có 1 completion → variance = 0 → false evidence ngược chiều
+
+  TRÁNH 3: Claim centroid dist mà không verify predictor đã converge
+    → Predictor chưa train → z_hat_T random → distance không phản ánh
+      centroid degeneracy mà phản ánh predictor capacity
+
+  TRÁNH 4: Confuse residual_var (Arg III) với MSE loss (không phân biệt được)
+    → Phải giải thích rõ sự khác biệt: residual_var đo variance CONDITIONED
+      on context, không phải unconditional loss
+
+  TRÁNH 5: Claim causal ordering Arg III → Arg II mà không có ablation
+    → Chỉ được claim temporal ordering. Causal claim cần ablation (VICReg).
+
+================================================================================
+END OF DOCUMENT
+================================================================================

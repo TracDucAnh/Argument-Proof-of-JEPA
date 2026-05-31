@@ -75,7 +75,7 @@ def add_instability_marker(ax, label: bool = True):
         f"T-JEPA instability\nstep {INSTABILITY_STEP:,}",
         xy=(INSTABILITY_STEP, ymax),
         xytext=(INSTABILITY_STEP + 300, ymax),
-        fontsize=FONT_ANNOT,
+        fontsize=FONT_ANNOT-1,
         color=C_INSTABILITY,
         va="top",
         ha="left",
