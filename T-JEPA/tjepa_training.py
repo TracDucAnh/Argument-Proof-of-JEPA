@@ -990,7 +990,6 @@ def train():
         iter_bar = tqdm(
             train_loader,
             total=len(train_loader),
-            desc=f"Ep {ep_display_start:03d}",
             unit="it",
             position=1,
             leave=True,
@@ -1001,6 +1000,8 @@ def train():
             # ── Derive epoch and iter from global_step ────────────────────
             ep  = epoch_of(global_step, steps_per_epoch)   # 1-based, never resets
             it  = iter_of(global_step, steps_per_epoch)    # 1-based within epoch
+
+            iter_bar.set_description(f"Ep {ep:03d}")
 
             current_lr  = lr_sched[global_step]
             current_wd  = wd_sched[global_step]
