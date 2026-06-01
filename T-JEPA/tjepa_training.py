@@ -506,14 +506,6 @@ def compute_arg3_irreducible_variance(
             z_masked_k = torch.gather(z_full_k, 1, mask_pos_idx)  # [K, M, 1024]
             z_pooled   = z_masked_k.mean(dim=1)                    # [K, 1024]
 
-            log.info(
-                f"  [ARG3 DEBUG ctx={contexts_done}]  "
-                f"ids_k unique={len(set(tuple(r.tolist()) for r in ids_k.cpu()))}/{K}  "
-                f"z_pooled.std={z_pooled.std(dim=0).mean().item():.6f}  "
-                f"z_pooled.norm={z_pooled.norm(dim=-1).mean().item():.4f}  "
-                f"var_i={var_i:.6f}"
-            )
-
 
             # ── Weighted variance theo Eq 12 ──────────────────────────────
             w       = variant_weights                          # [K]
@@ -521,6 +513,14 @@ def compute_arg3_irreducible_variance(
             diff    = z_pooled - z_mean.unsqueeze(0)           # [K, 1024]
             sq_dist = (diff ** 2).sum(dim=-1)                  # [K]
             var_i   = (w * sq_dist).sum().item()               # scalar
+
+            log.info(
+                f"  [ARG3 DEBUG ctx={contexts_done}]  "
+                f"ids_k unique={len(set(tuple(r.tolist()) for r in ids_k.cpu()))}/{K}  "
+                f"z_pooled.std={z_pooled.std(dim=0).mean().item():.6f}  "
+                f"z_pooled.norm={z_pooled.norm(dim=-1).mean().item():.4f}  "
+                f"var_i={var_i:.6f}"
+            )
 
             all_vars.append(var_i)
 
