@@ -334,33 +334,76 @@ def compute_arg2_metrics(z_flat: torch.Tensor, embed_dim: int) -> dict:
 
 @torch.no_grad()
 def compute_arg3_irreducible_variance(
-    target_encoder: torch.nn.Module,
-    ref_mlm_model: torch.nn.Module,
-    loader_iter,
-    device: torch.device,
+    target_encoder,       # EMA BERT-Large — only its embedding matrix is used
+    ref_mlm_model,        # frozen bert-base-uncased — MLM oracle for p(v|x_C)
+    loader_iter,          # iterator over train or val dataloader
+    device,
     tokenizer,
-    K: int             = 16,
-    N_ctx: int         = 200,
-    temperature: float = 1.0,
-    min_prob: float    = 0.001,
+    K: int             = 16,     # number of token completions to sample
+    N_ctx: int         = 200,    # number of contexts to average over
+    temperature: float = 1.0,    # softmax temperature for MLM sampling
+    min_prob: float    = 0.001,  # minimum probability threshold for candidates
     split: str         = "train",
 ) -> dict:
+    """
+    Estimate Var(z* | x_C, p_j) using the target encoder's embedding matrix.
+ 
+    For each masked position j in each context sentence:
+      1. Query the frozen MLM oracle to get p(v | x_C) at position j.
+      2. Sample K tokens {v_1, ..., v_K} from p(v | x_C).
+      3. Look up their embeddings in target_encoder.embeddings.word_embeddings:
+             z_k = E[v_k]  ∈ R^{1024}
+      4. Compute importance-weighted variance across K embedding vectors.
+      5. Average over all masked positions and all N_ctx contexts.
+ 
+    Args:
+        target_encoder : BERT-Large EMA model. Its embedding matrix E evolves
+                         via EMA throughout training, so irred_var reflects
+                         the current state of the target representation space.
+        ref_mlm_model  : frozen bert-base-uncased, used only to obtain
+                         p(v | x_C). Never updated; no gradients flow through.
+        loader_iter    : data iterator yielding batches with keys:
+                           clean_input_ids      [B, L]
+                           clean_attention_mask [B, L]
+                           span_mask            [B, L]  (1 at masked positions)
+        device         : torch.device
+        tokenizer      : HuggingFace tokenizer (for MASK token id)
+        K              : number of sampled completions per masked position
+        N_ctx          : total contexts to process
+        temperature    : softmax temperature applied to MLM logits
+        min_prob       : tokens with p < min_prob are excluded from candidates
+        split          : "train" or "val", used only for logging/tqdm label
+ 
+    Returns:
+        dict with keys:
+            irred_var         : mean weighted variance across all contexts
+            n_contexts        : actual number of contexts processed
+            mean_n_candidates : mean number of candidate tokens per position
+    """
     target_encoder.eval()
     ref_mlm_model.eval()
-
-    MASK_ID   = tokenizer.mask_token_id if tokenizer.mask_token_id is not None else 103
-    embed_dim = target_encoder.config.hidden_size  # 1024
-
-    # ── Cast target encoder sang float32 để tránh bfloat16 precision collapse ──
-    original_dtype = next(target_encoder.parameters()).dtype
-    log.info(f"  [ARG3] target_encoder dtype={original_dtype}, casting to float32")
-    if original_dtype != torch.float32:
-        target_encoder = target_encoder.float()
-
+ 
+    MASK_ID = tokenizer.mask_token_id if tokenizer.mask_token_id is not None else 103
+ 
+    # ── Extract embedding matrix from target encoder (EMA weights) ────────
+    # E ∈ R^{vocab_size × hidden_dim} — the direct token→vector mapping.
+    # This is the quantity Proposition A.12 refers to as {f_θ̄(v)}.
+    # We detach and cast to float32 for numerical stability.
+    emb_matrix = (
+        target_encoder
+        .embeddings
+        .word_embeddings
+        .weight
+        .detach()
+        .float()
+    )  # [V, 1024]
+ 
+    embed_dim = emb_matrix.shape[1]  # 1024 for BERT-Large
+ 
     all_vars          = []
     n_candidates_list = []
     contexts_done     = 0
-
+ 
     pbar = tqdm(
         total=N_ctx,
         desc=f"  Arg III [{split}]",
@@ -369,152 +412,153 @@ def compute_arg3_irreducible_variance(
         dynamic_ncols=True,
         position=3,
     )
-
+ 
     while contexts_done < N_ctx:
         try:
             batch = next(loader_iter)
         except StopIteration:
             break
-
-        input_ids      = batch["clean_input_ids"].to(device)
-        attention_mask = batch["clean_attention_mask"].to(device)
-        span_mask      = batch["span_mask"].to(device)
-
-        B, L   = input_ids.shape
+ 
+        input_ids      = batch["clean_input_ids"].to(device)       # [B, L]
+        attention_mask = batch["clean_attention_mask"].to(device)   # [B, L]
+        span_mask      = batch["span_mask"].to(device)              # [B, L]
+ 
+        B = input_ids.shape[0]
         budget = min(B, N_ctx - contexts_done)
         input_ids      = input_ids[:budget]
         attention_mask = attention_mask[:budget]
         span_mask      = span_mask[:budget]
-
-        # ── Collect valid rows + TẤT CẢ masked positions per row ─────────
+ 
+        # ── Collect rows that have at least one masked position ────────────
         valid_rows   = []
         all_mask_pos = []
-
+ 
         for i in range(budget):
             positions = span_mask[i].bool().nonzero(as_tuple=False).squeeze(-1)
             if positions.numel() == 0:
                 continue
             valid_rows.append(i)
             all_mask_pos.append(positions)
-
+ 
         if not valid_rows:
             continue
-
+ 
         ids_ctx  = input_ids[valid_rows]       # [V, L]
         attn_ctx = attention_mask[valid_rows]  # [V, L]
         V_rows   = ids_ctx.shape[0]
-
-        # ── Mask TẤT CẢ masked positions rồi hỏi ref_mlm_model ──────────
+ 
+        # ── Mask ALL positions then query ref MLM oracle ───────────────────
+        # We mask every span position at once so the MLM oracle sees the
+        # context without any of the target tokens — same setup as training.
         ids_all_masked = ids_ctx.clone()
         for i in range(V_rows):
             ids_all_masked[i, all_mask_pos[i]] = MASK_ID
-
+ 
         ref_out    = ref_mlm_model(
             input_ids      = ids_all_masked,
             attention_mask = attn_ctx,
         )
         ref_logits = ref_out.logits  # [V, L, vocab_size]
-
-        # ── Per-context ───────────────────────────────────────────────────
+ 
+        # ── Per-context variance computation ──────────────────────────────
         for i in range(V_rows):
-            mask_pos = all_mask_pos[i]   # [M] — TẤT CẢ masked positions
+            mask_pos = all_mask_pos[i]  # [M] — all masked positions
             M        = mask_pos.shape[0]
-
-            pos_candidates = []
-            pos_probs      = []
-
+ 
+            pos_sampled_ids    = []   # list of length M, each [K] token ids
+            pos_sample_probs   = []   # list of length M, each [K] probs
+ 
+            # ── Step 1: For each masked position, sample K tokens ──────────
             for pm in mask_pos:
                 pm_idx = pm.item()
-                p_pm   = torch.softmax(
+ 
+                # p(v | x_C) from frozen MLM oracle
+                p_pm = torch.softmax(
                     ref_logits[i, pm_idx].float() / temperature, dim=-1
-                )
-
+                )  # [vocab_size]
+ 
+                # Filter to candidate tokens above min_prob threshold
                 cand_mask  = p_pm >= min_prob
                 cand_ids   = cand_mask.nonzero(as_tuple=False).squeeze(-1)
                 cand_probs = p_pm[cand_ids]
                 n_cand     = cand_ids.shape[0]
-
+ 
                 if n_cand == 0:
                     cand_ids   = p_pm.argmax(keepdim=True)
                     cand_probs = torch.ones(1, device=device)
                     n_cand     = 1
-
+ 
                 cand_probs = cand_probs / cand_probs.sum()
-                pos_candidates.append(cand_ids)
-                pos_probs.append(cand_probs)
-                n_candidates_list.append(n_cand)
-
-            # ── Tạo K variants: thay TẤT CẢ M positions ──────────────────
-            ids_k = ids_all_masked[i:i+1].expand(K, -1).clone()  # [K, L]
-            variant_log_weights = torch.zeros(K, device=device)
-
-            for m_idx, pm in enumerate(mask_pos):
-                cand_ids_m   = pos_candidates[m_idx]
-                cand_probs_m = pos_probs[m_idx]
-                n_cand_m     = cand_ids_m.shape[0]
-
+ 
+                # Sample K tokens (with replacement if fewer candidates than K)
                 sampled_idx    = torch.multinomial(
-                    cand_probs_m,
+                    cand_probs,
                     num_samples=K,
-                    replacement=(n_cand_m < K),
+                    replacement=(n_cand < K),
                 )
-                sampled_tokens = cand_ids_m[sampled_idx]
-                sampled_probs  = cand_probs_m[sampled_idx]
-
-                ids_k[:, pm] = sampled_tokens
-                variant_log_weights += torch.log(sampled_probs + 1e-12)
-
+                sampled_tokens = cand_ids[sampled_idx]    # [K]
+                sampled_probs  = cand_probs[sampled_idx]  # [K]
+ 
+                pos_sampled_ids.append(sampled_tokens)
+                pos_sample_probs.append(sampled_probs)
+                n_candidates_list.append(n_cand)
+ 
+            # ── Step 2: Look up embeddings — NO forward pass needed ────────
+            # For each masked position, get K embedding vectors from the
+            # target encoder's embedding matrix (current EMA weights).
+            # Shape per position: [K, embed_dim]
+            #
+            # We then average over M positions to get one vector per variant,
+            # matching the original protocol's mean-pooling over masked tokens.
+ 
+            z_variants = torch.zeros(K, embed_dim, device=device)
+ 
+            for m_idx in range(M):
+                token_ids_k = pos_sampled_ids[m_idx]      # [K]
+                z_k = emb_matrix[token_ids_k]             # [K, 1024]
+                z_variants += z_k                         # accumulate
+ 
+            z_variants = z_variants / M  # mean over M positions → [K, 1024]
+ 
+            # ── Step 3: Importance-weighted variance across K variants ──────
+            # Weight each variant by the geometric mean of its token probs
+            # across all M positions (same logic as original protocol).
+            variant_log_weights = torch.zeros(K, device=device)
+            for m_idx in range(M):
+                variant_log_weights += torch.log(
+                    pos_sample_probs[m_idx] + 1e-12
+                )
             variant_log_weights -= variant_log_weights.max()
             variant_weights      = torch.exp(variant_log_weights)
             variant_weights      = variant_weights / variant_weights.sum()
-
-            attn_k = attn_ctx[i:i+1].expand(K, -1)
-
-            # ── Encode K variants — float32 weights, no autocast ──────────
-            z_full_k = target_encoder(
-                input_ids      = ids_k,
-                attention_mask = attn_k,
-            ).last_hidden_state  # [K, L, 1024] float32
-
-            # ── Mean-pool over TẤT CẢ M masked positions ─────────────────
-            mask_pos_idx = mask_pos.unsqueeze(0).unsqueeze(-1).expand(
-                K, -1, embed_dim
-            )  # [K, M, 1024]
-            z_masked_k = torch.gather(z_full_k, 1, mask_pos_idx)  # [K, M, 1024]
-            z_pooled   = z_masked_k.mean(dim=1)                    # [K, 1024]
-
-            # ── Weighted variance ─────────────────────────────────────────
-            w       = variant_weights
-            z_mean  = (w.unsqueeze(1) * z_pooled).sum(dim=0)
-            diff    = z_pooled - z_mean.unsqueeze(0)
-            sq_dist = (diff ** 2).sum(dim=-1)
-            var_i   = (w * sq_dist).sum().item()
-
-            # DEBUG
+ 
+            # Weighted mean embedding
+            w      = variant_weights                              # [K]
+            z_mean = (w.unsqueeze(1) * z_variants).sum(dim=0)   # [1024]
+ 
+            # Weighted sum of squared distances from mean
+            diff    = z_variants - z_mean.unsqueeze(0)           # [K, 1024]
+            sq_dist = (diff ** 2).sum(dim=-1)                    # [K]
+            var_i   = (w * sq_dist).sum().item()                 # scalar
+ 
             log.info(
-                f"  [ARG3 DEBUG ctx={contexts_done+i}]  "
+                f"  [ARG3-EMB ctx={contexts_done + i}]  "
                 f"M={M}  "
-                f"ids_k unique={len(set(tuple(r.tolist()) for r in ids_k.cpu()))}/{K}  "
-                f"z_pooled.std={z_pooled.std(dim=0).mean().item():.6f}  "
-                f"z_pooled.norm={z_pooled.norm(dim=-1).mean().item():.4f}  "
+                f"n_cand_mean={sum(n_candidates_list[-M:]) / M:.1f}  "
+                f"z_variants.std={z_variants.std(dim=0).mean().item():.6f}  "
                 f"var_i={var_i:.8f}"
             )
-
+ 
             all_vars.append(var_i)
-
+ 
         contexts_done += V_rows
         pbar.update(V_rows)
-
+ 
     pbar.close()
-
-    # ── Cast target encoder trở lại dtype gốc ────────────────────────────
-    if original_dtype != torch.float32:
-        target_encoder = target_encoder.to(original_dtype)
-        log.info(f"  [ARG3] target_encoder cast back to {original_dtype}")
-
+ 
     mean_var    = float(np.mean(all_vars))          if all_vars          else float("nan")
     mean_n_cand = float(np.mean(n_candidates_list)) if n_candidates_list else float("nan")
-
+ 
     return dict(
         irred_var         = round(mean_var,    8),
         n_contexts        = contexts_done,
