@@ -115,7 +115,7 @@ CFG = dict(
     arg2_every       = 10,
     arg2_sample_size = 2048,
     # ── ARGUMENT III metrics ──────────────────────────────────────────────
-    arg3_every       = 10,   # every 500 steps, on both train and val
+    arg3_every       = 100,   # every 500 steps, on both train and val
     arg3_K           = 16,    # K token completions per masked position
     arg3_N_ctx       = 200,   # number of contexts to average over
     arg3_temperature = 1.0,   # softmax temperature for token sampling
@@ -541,13 +541,13 @@ def compute_arg3_irreducible_variance(
             sq_dist = (diff ** 2).sum(dim=-1)                    # [K]
             var_i   = (w * sq_dist).sum().item()                 # scalar
  
-            log.info(
-                f"  [ARG3-EMB ctx={contexts_done + i}]  "
-                f"M={M}  "
-                f"n_cand_mean={sum(n_candidates_list[-M:]) / M:.1f}  "
-                f"z_variants.std={z_variants.std(dim=0).mean().item():.6f}  "
-                f"var_i={var_i:.8f}"
-            )
+            # log.info(
+            #     f"  [ARG3-EMB ctx={contexts_done + i}]  "
+            #     f"M={M}  "
+            #     f"n_cand_mean={sum(n_candidates_list[-M:]) / M:.1f}  "
+            #     f"z_variants.std={z_variants.std(dim=0).mean().item():.6f}  "
+            #     f"var_i={var_i:.8f}"
+            # )
  
             all_vars.append(var_i)
  
