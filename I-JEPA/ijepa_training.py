@@ -132,7 +132,7 @@ CFG = dict(
     arg2_every      = 10,
     arg2_sample_size = 2048,
     # ── ARGUMENT III metrics ──────────────────────────────────────────────
-    arg3_every      = 500,    # every 500 steps, on both train and val
+    arg3_every      = 100,    # every 500 steps, on both train and val
     arg3_K          = 16,     # K augmented completions per context
     arg3_N_ctx      = 200,    # number of contexts to average over
     arg3_aug_sigma  = 0.2,    # Gaussian noise std for augmentation
