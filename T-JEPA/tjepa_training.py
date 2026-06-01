@@ -118,7 +118,7 @@ CFG = dict(
     arg3_every       = 500,   # every 500 steps, on both train and val
     arg3_K           = 16,    # K token completions per masked position
     arg3_N_ctx       = 200,   # number of contexts to average over
-    arg3_temperature = 2.0,   # softmax temperature for token sampling
+    arg3_temperature = 1.0,   # softmax temperature for token sampling
     arg3_min_prob    = 0.001,  # minimum token probability to be a candidate
     # bert-base-uncased used as frozen MLM oracle for Arg III token sampling
     arg3_ref_model   = "bert-base-uncased",
@@ -342,46 +342,29 @@ def compute_arg3_irreducible_variance(
     K: int             = 16,
     N_ctx: int         = 200,
     temperature: float = 1.0,
-    min_prob: float    = 0.01,
+    min_prob: float    = 0.001,
     split: str         = "train",
 ) -> dict:
     """
-    Estimate Var(z* | x_C, p_j) for text — đúng theo Proposition A.12 trong paper.
+    Estimate Var(z* | x_C, p_j) — đúng theo Proposition A.12.
 
     Protocol:
-        Với mỗi context x_C và masked position j:
-          1. Dùng ref_mlm_model (frozen bert-base) để lấy p(v | x_C) tại position j.
-          2. Lấy tất cả token candidates với p(v|x_C) >= min_prob → V(x_C).
-          3. Với mỗi token v_k ∈ V(x_C): thay position j bằng v_k, encode qua
-             frozen target_encoder → z*_k ∈ R^1024.
-          4. Tính weighted variance theo Eq 12:
-             Var = Σ_v p(v|x_C) * ||z*_v - z̄||²
-             với z̄ = Σ_v p(v|x_C) * z*_v  (conditional mean / centroid)
-          5. Average over N_ctx contexts.
-
-    Args:
-        target_encoder: frozen EMA BERT-Large encoder (model.target_encoder)
-        ref_mlm_model:  frozen bert-base-uncased BertForMaskedLM
-        loader_iter:    iterator over make_c4_dataloader batches
-        device:         torch.device
-        tokenizer:      HuggingFace tokenizer (for mask_token_id)
-        K:              max number of unique token candidates to use
-                        (dùng min(K, |V(x_C)|) candidates — không replacement)
-        N_ctx:          number of contexts to average over
-        temperature:    softmax temperature for token sampling (ref_mlm_model)
-        min_prob:       minimum token probability threshold
-        split:          "train" or "val" — used in tqdm description
-
-    Returns:
-        dict:
-            irred_var          — mean weighted Var(z*|x_C,p_j) over N_ctx contexts
-            n_contexts         — actual contexts processed
-            mean_n_candidates  — mean |V(x_C)| (number of unique candidates)
+        Với mỗi context (câu):
+          1. Lấy TẤT CẢ masked positions trong câu (có thể 1-25 positions
+             nếu có 1-5 spans × 1-5 tokens/span).
+          2. Với mỗi masked position p, hỏi ref_mlm_model → p(v | x_C) tại p.
+          3. Tạo K variants: mỗi variant thay TẤT CẢ masked positions bằng
+             tokens sampled từ p(v | x_C, p) tương ứng.
+          4. Encode K variants qua target_encoder → [K, L, D].
+          5. Mean-pool hidden states tại TẤT CẢ masked positions → [K, D].
+          6. Weighted variance over K pooled vectors → scalar.
+          7. Average over N_ctx contexts.
     """
     target_encoder.eval()
     ref_mlm_model.eval()
 
-    MASK_ID = tokenizer.mask_token_id if tokenizer.mask_token_id is not None else 103
+    MASK_ID   = tokenizer.mask_token_id if tokenizer.mask_token_id is not None else 103
+    embed_dim = target_encoder.config.hidden_size  # 1024
 
     all_vars          = []
     n_candidates_list = []
@@ -412,15 +395,18 @@ def compute_arg3_irreducible_variance(
         attention_mask = attention_mask[:budget]
         span_mask      = span_mask[:budget]
 
-        # ── Find first masked position per row ────────────────────────────
-        valid_rows = []
-        masked_pos = []
+        # ── Collect valid rows + TẤT CẢ masked positions per row ─────────
+        # span_mask = 1 tại MỌI vị trí bị mask (toàn bộ 1-5 spans × 1-5 tokens)
+        valid_rows   = []
+        all_mask_pos = []  # list of 1D tensors [n_masked_tokens]
+
         for i in range(budget):
+            # Lấy TẤT CẢ positions bị mask trong câu — không chỉ 1 span
             positions = span_mask[i].bool().nonzero(as_tuple=False).squeeze(-1)
             if positions.numel() == 0:
                 continue
             valid_rows.append(i)
-            masked_pos.append(positions[0].item())
+            all_mask_pos.append(positions)  # [n_masked] — có thể 1-25 positions
 
         if not valid_rows:
             continue
@@ -428,94 +414,106 @@ def compute_arg3_irreducible_variance(
         ids_ctx  = input_ids[valid_rows]       # [V, L]
         attn_ctx = attention_mask[valid_rows]  # [V, L]
         V_rows   = ids_ctx.shape[0]
-        masked_pos_t = torch.tensor(masked_pos, device=device)  # [V_rows]
 
-        # ── Replace masked position with [MASK] for ref_mlm_model ─────────
-        ids_masked = ids_ctx.clone()
-        ids_masked[torch.arange(V_rows, device=device), masked_pos_t] = MASK_ID
+        # ── Mask TẤT CẢ masked positions rồi hỏi ref_mlm_model một lần ──
+        ids_all_masked = ids_ctx.clone()
+        for i in range(V_rows):
+            ids_all_masked[i, all_mask_pos[i]] = MASK_ID
 
-        # ── Get MLM logits from frozen bert-base-uncased ──────────────────
         ref_out    = ref_mlm_model(
-            input_ids      = ids_masked,
+            input_ids      = ids_all_masked,
             attention_mask = attn_ctx,
         )
-        ref_logits = ref_out.logits  # [V_rows, L, vocab_size]
+        ref_logits = ref_out.logits  # [V, L, vocab_size]
 
-        # Extract logits at masked position j per row → [V_rows, vocab_size]
-        pos_logits = ref_logits[torch.arange(V_rows, device=device), masked_pos_t]
-
-        # ── Per-context weighted variance — đúng theo Eq 12 ──────────────
-        batch_vars = []
-
+        # ── Per-context ───────────────────────────────────────────────────
         for i in range(V_rows):
-            # p(v | x_C) từ bert-base với temperature scaling
-            p_i = torch.softmax(pos_logits[i].float() / temperature, dim=-1)  # [vocab_size]
+            mask_pos = all_mask_pos[i]   # [M] — TẤT CẢ masked positions
+            M        = mask_pos.shape[0]
 
-            # Lấy tất cả candidates có p >= min_prob → V(x_C)
-            cand_mask  = p_i >= min_prob
-            cand_ids   = cand_mask.nonzero(as_tuple=False).squeeze(-1)  # [n_cand]
-            cand_probs = p_i[cand_ids]                                   # [n_cand]
-            n_cand     = cand_ids.shape[0]
+            # Với mỗi masked position: lấy candidates và probs
+            pos_candidates = []  # [M] list of [n_cand_m]
+            pos_probs      = []  # [M] list of [n_cand_m]
 
-            # Fallback: nếu không có candidate nào (hiếm), lấy top-1
-            if n_cand == 0:
-                cand_ids   = p_i.argmax(keepdim=True)
-                cand_probs = torch.ones(1, device=device)
-                n_cand     = 1
+            for pm in mask_pos:
+                pm_idx = pm.item()
+                p_pm   = torch.softmax(
+                    ref_logits[i, pm_idx].float() / temperature, dim=-1
+                )  # [vocab_size]
 
-            n_candidates_list.append(n_cand)
+                cand_mask  = p_pm >= min_prob
+                cand_ids   = cand_mask.nonzero(as_tuple=False).squeeze(-1)
+                cand_probs = p_pm[cand_ids]
+                n_cand     = cand_ids.shape[0]
 
-            # Dùng tối đa K candidates — KHÔNG replacement, unique tokens
-            # Đây là điểm then chốt: mỗi token chỉ xuất hiện 1 lần
-            n_use = min(K, n_cand)
+                if n_cand == 0:
+                    cand_ids   = p_pm.argmax(keepdim=True)
+                    cand_probs = torch.ones(1, device=device)
+                    n_cand     = 1
 
-            if n_use < n_cand:
-                # Sample n_use tokens theo xác suất, không trùng
-                chosen_idx = torch.multinomial(
-                    cand_probs,
-                    num_samples=n_use,
-                    replacement=False,
+                cand_probs = cand_probs / cand_probs.sum()
+                pos_candidates.append(cand_ids)
+                pos_probs.append(cand_probs)
+                n_candidates_list.append(n_cand)
+
+            # ── Tạo K variants: mỗi variant thay TẤT CẢ M positions ──────
+            # ids_k bắt đầu từ câu đã mask hết
+            ids_k = ids_all_masked[i:i+1].expand(K, -1).clone()  # [K, L]
+
+            # Log-weight của mỗi variant = Σ log p(token_k | context, pos_m)
+            variant_log_weights = torch.zeros(K, device=device)
+
+            for m_idx, pm in enumerate(mask_pos):
+                cand_ids_m   = pos_candidates[m_idx]  # [n_cand]
+                cand_probs_m = pos_probs[m_idx]        # [n_cand]
+                n_cand_m     = cand_ids_m.shape[0]
+
+                # Sample K tokens cho position pm — có replacement nếu n_cand < K
+                sampled_idx    = torch.multinomial(
+                    cand_probs_m,
+                    num_samples=K,
+                    replacement=(n_cand_m < K),
                 )
-            else:
-                # Dùng hết tất cả candidates
-                chosen_idx = torch.arange(n_cand, device=device)
+                sampled_tokens = cand_ids_m[sampled_idx]    # [K]
+                sampled_probs  = cand_probs_m[sampled_idx]  # [K]
 
-            chosen_token_ids = cand_ids[chosen_idx]    # [n_use]
-            chosen_probs     = cand_probs[chosen_idx]  # [n_use]
+                # Thay position pm trong TẤT CẢ K variants
+                ids_k[:, pm] = sampled_tokens
 
-            # Renormalize weights trên n_use candidates được chọn
-            chosen_probs = chosen_probs / chosen_probs.sum()
+                # Accumulate log weight
+                variant_log_weights += torch.log(sampled_probs + 1e-12)
 
-            # ── Build n_use variants: thay position j bằng mỗi token ──────
-            ids_k  = ids_masked[i:i+1].expand(n_use, -1).clone()  # [n_use, L]
-            ids_k[torch.arange(n_use, device=device), masked_pos_t[i]] = chosen_token_ids
-            attn_k = attn_ctx[i:i+1].expand(n_use, -1)            # [n_use, L]
+            # Normalize weights
+            variant_log_weights -= variant_log_weights.max()
+            variant_weights      = torch.exp(variant_log_weights)
+            variant_weights      = variant_weights / variant_weights.sum()  # [K]
 
-            # ── Encode qua frozen target_encoder, TẮT autocast ───────────
-            # Tắt bfloat16 để tránh precision collapse khi z* gần nhau
+            attn_k = attn_ctx[i:i+1].expand(K, -1)  # [K, L]
+
+            # ── Encode K variants — tắt bfloat16 để tránh precision loss ──
             with torch.amp.autocast(device_type="cuda", enabled=False):
                 z_full_k = target_encoder(
                     input_ids      = ids_k,
                     attention_mask = attn_k,
-                ).last_hidden_state.float()  # [n_use, L, 1024]
+                ).last_hidden_state.float()  # [K, L, 1024]
 
-            z_at_j = z_full_k[:, masked_pos_t[i], :]  # [n_use, 1024]
+            # ── Mean-pool over TẤT CẢ M masked positions — mirror I-JEPA ─
+            # I-JEPA: gather all patch positions → mean → [K, D]
+            # T-JEPA: gather all masked token positions → mean → [K, D]
+            mask_pos_idx = mask_pos.unsqueeze(0).unsqueeze(-1).expand(
+                K, -1, embed_dim
+            )  # [K, M, 1024]
+            z_masked_k = torch.gather(z_full_k, 1, mask_pos_idx)  # [K, M, 1024]
+            z_pooled   = z_masked_k.mean(dim=1)                    # [K, 1024]
 
-            # ── Weighted variance theo Eq 12 của paper ────────────────────
-            # z̄ = Σ_v p(v|x_C) * z*_v  (conditional mean / centroid)
-            w      = chosen_probs                                   # [n_use]
-            z_mean = (w.unsqueeze(1) * z_at_j).sum(dim=0)          # [1024]
+            # ── Weighted variance theo Eq 12 ──────────────────────────────
+            w       = variant_weights                          # [K]
+            z_mean  = (w.unsqueeze(1) * z_pooled).sum(dim=0)  # [1024]
+            diff    = z_pooled - z_mean.unsqueeze(0)           # [K, 1024]
+            sq_dist = (diff ** 2).sum(dim=-1)                  # [K]
+            var_i   = (w * sq_dist).sum().item()               # scalar
 
-            # Var = Σ_v p(v|x_C) * ||z*_v - z̄||²
-            diff      = z_at_j - z_mean.unsqueeze(0)               # [n_use, 1024]
-            sq_dist   = (diff ** 2).sum(dim=-1)                    # [n_use]
-            var_i     = (w * sq_dist).sum()                        # scalar
-
-            batch_vars.append(var_i.item())
-
-        # Average over valid rows in this batch
-        if batch_vars:
-            all_vars.append(float(np.mean(batch_vars)))
+            all_vars.append(var_i)
 
         contexts_done += V_rows
         pbar.update(V_rows)
@@ -530,7 +528,6 @@ def compute_arg3_irreducible_variance(
         n_contexts        = contexts_done,
         mean_n_candidates = round(mean_n_cand, 2),
     )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Held-out evaluation
