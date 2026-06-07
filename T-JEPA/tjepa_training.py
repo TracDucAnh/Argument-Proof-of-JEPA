@@ -88,10 +88,10 @@ CFG = dict(
     # model (BERT-Large)
     model_name      = "bert_large",
     hidden_dim      = 1024,
-    predictor_dim   = 384,
-    predictor_layers= 12,
-    predictor_heads = 16,
-    predictor_ffn_dim = 1536,
+    predictor_dim   = 512,
+    predictor_layers= 6,
+    predictor_heads = 8,
+    predictor_ffn_dim = 2048,
     use_bfloat16    = True,
     # ── STABILITY PARAMS (mirrored with I-JEPA) ───────────────────────────
     epochs          = 15,
