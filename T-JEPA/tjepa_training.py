@@ -34,6 +34,16 @@
 # I/O ORDERING GUARANTEE:
 #   All disk writes go through save_records() → save_checkpoint() in strict order.
 #
+# CONTEXT-ENCODER HIDDEN-STATE HEATMAPS:
+#   • Every log_every 10 steps, the current context_encoder is run on a fixed
+#     probe SENTENCE and the resulting hidden states (cropped to the first
+#     768 dims) are rendered as a heatmap (token x dim).
+#   • Each heatmap is saved with a step-affixed filename so the evolution of
+#     the representation can be inspected across training:
+#         T-JEPA_heatmap_step{global_step:06d}.png
+#   • Files are written via atomic tmp->rename, identical pattern to the
+#     other JSON/PNG writers in this script.
+#
 # Usage (run from T-JEPA/ directory):
 #   python tjepa_training.py
 # ─────────────────────────────────────────────────────────────────────────────
@@ -66,6 +76,18 @@ JSON_ARG3_VAL      = ARG_I_DIR / "T-JEPA_arg3_val.json"
 PNG_PATH           = ARG_I_DIR / "T-JEPA.png"
 CKPT_PATH          = ARG_I_DIR / "T-JEPA_latest.pt"
 
+# ── context-encoder hidden-state heatmap outputs ──────────────────────────────
+HEATMAP_DIR = ARG_I_DIR / "heatmaps"
+HEATMAP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Fixed probe sentence used for every heatmap snapshot, so frames are comparable.
+HEATMAP_SENTENCE = (
+    "I enjoy researching natural language processing, information theory, "
+    "and representations in the fields of machine learning and deep learning"
+)
+HEATMAP_CROP_DIM = 768  # crop hidden_dim (1024 for BERT-Large) down to first 768 dims
+
+
 sys.path.insert(0, str(SCRIPT_DIR))
 from tjepa_architecture import TextJEPA, compute_effective_rank
 from tjepa_dataloader   import make_c4_dataloader
@@ -88,10 +110,10 @@ CFG = dict(
     # model (BERT-Large)
     model_name      = "bert_large",
     hidden_dim      = 1024,
-    predictor_dim   = 512,
-    predictor_layers= 6,
-    predictor_heads = 8,
-    predictor_ffn_dim = 2048,
+    predictor_dim   = 384,
+    predictor_layers= 12,
+    predictor_heads = 16,
+    predictor_ffn_dim = 1536,
     use_bfloat16    = True,
     # ── STABILITY PARAMS (mirrored with I-JEPA) ───────────────────────────
     epochs          = 15,
@@ -125,6 +147,7 @@ CFG = dict(
     # ── MOCO QUEUE ────────────────────────────────────────────────────────
     moco_queue_size  = 2048,
     device          = "cuda" if torch.cuda.is_available() else "cpu",
+    heatmap_every = 10
 )
 
 logging.basicConfig(
@@ -147,6 +170,122 @@ def epoch_of(global_step: int, steps_per_epoch: int) -> int:
 def iter_of(global_step: int, steps_per_epoch: int) -> int:
     """1-based iteration-within-epoch derived from global_step."""
     return (global_step % steps_per_epoch) + 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Context-encoder hidden-state heatmap (per log_every step, step-affixed file)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def get_encoder_hidden_state(model: "TextJEPA", tokenizer, text: str, device: torch.device):
+    """
+    Run the (currently-training) context encoder on `text` and return its
+    last hidden state cropped to the first HEATMAP_CROP_DIM dims, plus the
+    corresponding token strings.
+
+    Returns:
+        hidden : np.ndarray [N_tokens, HEATMAP_CROP_DIM]
+        tokens : list[str]  length N_tokens
+    """
+    was_training = model.context_encoder.training
+    model.context_encoder.eval()
+
+    inputs = tokenizer(text, return_tensors="pt").to(device)
+    out    = model.context_encoder(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+    )
+    hidden_full = out.last_hidden_state[0]  # [N_tokens, hidden_dim]
+
+    crop_dim = min(HEATMAP_CROP_DIM, hidden_full.shape[-1])
+    hidden   = hidden_full[:, :crop_dim].float().cpu().numpy()
+
+    tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0].cpu())
+
+    if was_training:
+        model.context_encoder.train()
+
+    return hidden, tokens
+
+
+def plot_heatmap(hidden: np.ndarray, tokens: list[str], title: str, out_path: Path) -> None:
+    """
+    Render a token x dim heatmap of `hidden` and save it (atomically) to
+    `out_path`. Mirrors the layout/style of the standalone reference script.
+    """
+    N, D = hidden.shape
+
+    cell_px      = 12
+    matrix_h     = N * cell_px
+    matrix_w     = matrix_h
+    dpi          = 100
+    margin_left  = 130
+    margin_right = 80
+    margin_top   = 60
+    margin_bot   = 50
+
+    fig_w = (matrix_w + margin_left + margin_right) / dpi
+    fig_h = (matrix_h + margin_top  + margin_bot)   / dpi
+
+    fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
+
+    left   = margin_left / (fig_w * dpi)
+    bottom = margin_bot  / (fig_h * dpi)
+    width  = matrix_w    / (fig_w * dpi)
+    height = matrix_h    / (fig_h * dpi)
+
+    ax = fig.add_axes([left, bottom, width, height], facecolor="white")
+    im = ax.imshow(
+        hidden,
+        aspect="auto",
+        cmap="magma",
+        interpolation="nearest",
+    )
+
+    # Trục Y: tên token
+    ax.set_yticks(np.arange(N))
+    ax.set_yticklabels(tokens, fontsize=9, color="black")
+    ax.yaxis.set_tick_params(length=0, pad=6)
+
+    # Trục X: chỉ label
+    ax.set_xticks([])
+    ax.set_xlabel("dim",   fontsize=11, color="#444444", labelpad=8)
+    ax.set_ylabel("token", fontsize=11, color="#444444", labelpad=8)
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    ax.set_title(title, fontsize=13, fontweight="bold", color="black", pad=14)
+
+    # Colorbar
+    cbar_ax = fig.add_axes([left + width + 0.02, bottom, 0.025, height])
+    cbar = fig.colorbar(im, cax=cbar_ax)
+    cbar.ax.yaxis.set_tick_params(color="black", length=0)
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="black", fontsize=8)
+    cbar.outline.set_visible(False)
+
+    tmp = out_path.with_suffix(".tmp.png")
+    fig.savefig(str(tmp), dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    tmp.replace(out_path)
+
+
+@torch.no_grad()
+def save_context_encoder_heatmap(model: "TextJEPA", tokenizer, device: torch.device, global_step: int) -> None:
+    """
+    Compute and save a step-affixed heatmap of the context encoder's hidden
+    states for HEATMAP_SENTENCE (cropped to the first HEATMAP_CROP_DIM dims).
+    Filename: T-JEPA_heatmap_step{global_step:06d}.png
+    """
+    hidden, tokens = get_encoder_hidden_state(model, tokenizer, HEATMAP_SENTENCE, device)
+
+    out_path = HEATMAP_DIR / f"T-JEPA_heatmap_step{global_step:06d}.png"
+    title    = f"T-JEPA Context Encoder — step {global_step}"
+
+    try:
+        plot_heatmap(hidden, tokens, title, out_path)
+    except OSError as e:
+        log.warning(f"save_context_encoder_heatmap failed at step {global_step}: {e} — heatmap skipped")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1032,6 +1171,11 @@ def train():
         f"total_steps={total_steps}  "
         f"epochs={CFG['epochs']}"
     )
+    log.info(
+        f"Context-encoder hidden-state heatmaps will be saved every "
+        f"{CFG['log_every']} steps to {HEATMAP_DIR} "
+        f"(cropped to first {HEATMAP_CROP_DIM} dims, step-affixed filenames)"
+    )
 
     train_records      = []
     val_records        = []
@@ -1174,6 +1318,12 @@ def train():
                     )
 
                 train_records.append(record)
+
+                # ── Context-encoder hidden-state heatmap (per log_every step) ──
+                # Saved with a step-affixed filename (no overwrite) so the
+                # evolution of the representation can be inspected frame-by-frame.
+                if global_step % CFG["heatmap_every"] == 0:
+                    save_context_encoder_heatmap(model, tokenizer, device, global_step)
 
             if global_step % CFG["eval_every"] == 0:
                 log.info(f"  → Running held-out eval at step {global_step} ...")
